@@ -2,6 +2,8 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
+import admin from "firebase-admin";
+import serviceAccount from "./firebase-key.json" assert { type: "json" };
 
 dotenv.config();
 
@@ -9,41 +11,76 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+/* 🔥 FIREBASE INIT */
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const db = admin.firestore();
+
+/* 🔑 GEMINI CONFIG */
 const API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = "gemini-2.5-flash";
 
-
-// 🔥 SIMPLE DB FUNCTION
-function searchDatabase(symptoms) {
+/* 🔥 SEARCH FROM FIREBASE (DOCTOR LEARNING) */
+async function searchDoctorUsage(symptoms) {
   let medicines = [];
 
-  const map = {
-    fever: ["paracetamol"],
-    headache: ["brufen"],
-    anxiety: ["ignatia", "aconite"],
-    "night sweats": ["silicea"],
-  };
+  for (const sym of symptoms) {
+    const snapshot = await db
+      .collection("doctor_uses")
+      .where("symptom", "==", sym.toLowerCase())
+      .orderBy("usage_count", "desc")
+      .limit(3)
+      .get();
 
-  symptoms.forEach((sym) => {
-    const key = sym.toLowerCase();
-    if (map[key]) {
-      medicines.push(...map[key]);
-    }
-  });
+    snapshot.forEach((doc) => {
+      medicines.push(doc.data().medicine_name);
+    });
+  }
 
-  return {
-    medicines: [...new Set(medicines)],
-  };
+  return [...new Set(medicines)];
 }
 
+/* 🔥 SAVE LEARNING */
+async function updateDoctorUsage(doctor_id, symptoms, medicines) {
+  for (const sym of symptoms) {
+    for (const med of medicines) {
+      const snapshot = await db
+        .collection("doctor_uses")
+        .where("doctor_id", "==", doctor_id)
+        .where("symptom", "==", sym.toLowerCase())
+        .where("medicine_name", "==", med.toLowerCase())
+        .get();
 
-// 🚀 MAIN API
+      if (!snapshot.empty) {
+        const doc = snapshot.docs[0];
+
+        await doc.ref.update({
+          usage_count: admin.firestore.FieldValue.increment(1),
+          last_used: new Date(),
+        });
+      } else {
+        await db.collection("doctor_uses").add({
+          doctor_id,
+          symptom: sym.toLowerCase(),
+          medicine_name: med.toLowerCase(),
+          usage_count: 1,
+          created_at: new Date(),
+          last_used: new Date(),
+        });
+      }
+    }
+  }
+}
+
+/* 🚀 ANALYZE API */
 app.post("/analyze", async (req, res) => {
   try {
     const { text } = req.body;
 
     if (!text) {
-      return res.status(400).json({ error: "Text is required" });
+      return res.status(400).json({ error: "Text required" });
     }
 
     const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
@@ -65,8 +102,7 @@ Extract symptoms and medicines.
 
 Text: ${text}
 
-ONLY return valid JSON. No explanation.
-
+Return ONLY JSON:
 {
   "symptoms": [],
   "medicines": []
@@ -87,67 +123,34 @@ ONLY return valid JSON. No explanation.
     let aiText =
       data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-    // 🔥 CLEAN RESPONSE
-    aiText = aiText
-      .replace(/```json/gi, "")
-      .replace(/```/g, "")
-      .trim();
-
-    // 🔥 JSON EXTRACT
-    const jsonMatch = aiText.match(/\{[\s\S]*\}/);
-
-    if (!jsonMatch) {
-      return res.json({
-        source: "gemini_raw",
-        raw: aiText,
-      });
-    }
+    /* 🔥 CLEAN RESPONSE */
+    aiText = aiText.replace(/```json|```/g, "").trim();
 
     let aiResponse;
 
     try {
-      aiResponse = JSON.parse(jsonMatch[0]);
-    } catch (err) {
-      return res.json({
-        source: "gemini_parse_error",
-        raw: aiText,
-      });
+      aiResponse = JSON.parse(aiText);
+    } catch {
+      aiResponse = { symptoms: [], medicines: [] };
     }
 
-    // 🔥 DB SEARCH
-    const dbResult = searchDatabase(aiResponse.symptoms || []);
+    /* 🔥 DB LEARNING FIRST */
+    const learnedMedicines = await searchDoctorUsage(
+      aiResponse.symptoms || []
+    );
 
-    let finalMedicines = aiResponse.medicines || [];
-    let source = "gemini";
+    let finalMedicines = [];
 
-    // 👉 HYBRID LOGIC
-    if (!finalMedicines || finalMedicines.length === 0) {
-      finalMedicines = dbResult.medicines;
-      source = "ai+database";
+    if (learnedMedicines.length > 0) {
+      finalMedicines = learnedMedicines;
     } else {
-      finalMedicines = [
-        ...new Set([...finalMedicines, ...dbResult.medicines]),
-      ];
-      source = "gemini+database";
+      finalMedicines = aiResponse.medicines || [];
     }
 
-    // 🔥 FINAL RESPONSE (DEBUG + RESULT)
     return res.json({
-      source,
-      input: text,
-
-      debug: {
-        ai_raw_text: aiText,
-        ai_response: aiResponse,
-        db_result: dbResult,
-      },
-
-      final: {
-        symptoms: aiResponse.symptoms || [],
-        medicines: finalMedicines,
-      },
+      symptoms: aiResponse.symptoms || [],
+      medicines: finalMedicines,
     });
-
   } catch (error) {
     res.status(500).json({
       error: "Server Error",
@@ -156,10 +159,29 @@ ONLY return valid JSON. No explanation.
   }
 });
 
+/* 💾 SAVE PRESCRIPTION (LEARNING API) */
+app.post("/save-prescription", async (req, res) => {
+  try {
+    const { doctor_id, symptoms, medicines } = req.body;
 
-// 🔥 SERVER START
+    if (!doctor_id || !symptoms || !medicines) {
+      return res.status(400).json({ error: "Missing data" });
+    }
+
+    await updateDoctorUsage(doctor_id, symptoms, medicines);
+
+    return res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({
+      error: "Save failed",
+      msg: error.message,
+    });
+  }
+});
+
+/* 🚀 START SERVER */
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on ${PORT}`);
+  console.log(`🔥 Server running on ${PORT}`);
 });
