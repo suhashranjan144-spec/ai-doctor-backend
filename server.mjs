@@ -3,7 +3,6 @@ import cors from "cors";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
 import admin from "firebase-admin";
-import serviceAccount from "./firebase-key.json" assert { type: "json" };
 
 dotenv.config();
 
@@ -11,7 +10,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* 🔥 FIREBASE INIT */
+/* 🔥 FIREBASE INIT (FROM ENV) */
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
@@ -22,7 +23,7 @@ const db = admin.firestore();
 const API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = "gemini-2.5-flash";
 
-/* 🔥 SEARCH FROM FIREBASE (DOCTOR LEARNING) */
+/* 🔥 SEARCH FROM FIREBASE */
 async function searchDoctorUsage(symptoms) {
   let medicines = [];
 
@@ -123,7 +124,6 @@ Return ONLY JSON:
     let aiText =
       data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-    /* 🔥 CLEAN RESPONSE */
     aiText = aiText.replace(/```json|```/g, "").trim();
 
     let aiResponse;
@@ -134,23 +134,20 @@ Return ONLY JSON:
       aiResponse = { symptoms: [], medicines: [] };
     }
 
-    /* 🔥 DB LEARNING FIRST */
     const learnedMedicines = await searchDoctorUsage(
       aiResponse.symptoms || []
     );
 
-    let finalMedicines = [];
-
-    if (learnedMedicines.length > 0) {
-      finalMedicines = learnedMedicines;
-    } else {
-      finalMedicines = aiResponse.medicines || [];
-    }
+    let finalMedicines =
+      learnedMedicines.length > 0
+        ? learnedMedicines
+        : aiResponse.medicines || [];
 
     return res.json({
       symptoms: aiResponse.symptoms || [],
       medicines: finalMedicines,
     });
+
   } catch (error) {
     res.status(500).json({
       error: "Server Error",
@@ -159,7 +156,7 @@ Return ONLY JSON:
   }
 });
 
-/* 💾 SAVE PRESCRIPTION (LEARNING API) */
+/* 💾 SAVE PRESCRIPTION */
 app.post("/save-prescription", async (req, res) => {
   try {
     const { doctor_id, symptoms, medicines } = req.body;
@@ -171,6 +168,7 @@ app.post("/save-prescription", async (req, res) => {
     await updateDoctorUsage(doctor_id, symptoms, medicines);
 
     return res.json({ success: true });
+
   } catch (error) {
     res.status(500).json({
       error: "Save failed",
