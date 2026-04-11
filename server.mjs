@@ -23,7 +23,7 @@ const db = admin.firestore();
 const API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = "gemini-2.5-flash";
 
-/* 🔥 SEARCH FROM FIREBASE */
+/* 🔍 SEARCH FROM FIREBASE */
 async function searchDoctorUsage(symptoms) {
   let medicines = [];
 
@@ -43,7 +43,7 @@ async function searchDoctorUsage(symptoms) {
   return [...new Set(medicines)];
 }
 
-/* 🔥 SAVE LEARNING */
+/* 💾 SAVE LEARNING */
 async function updateDoctorUsage(doctor_id, symptoms, medicines) {
   for (const sym of symptoms) {
     for (const med of medicines) {
@@ -75,10 +75,10 @@ async function updateDoctorUsage(doctor_id, symptoms, medicines) {
   }
 }
 
-/* 🚀 ANALYZE API */
+/* 🚀 ANALYZE API (FINAL AI LOGIC) */
 app.post("/analyze", async (req, res) => {
   try {
-    const { text } = req.body;
+    const { text, doctor_id = "default_doc" } = req.body;
 
     if (!text) {
       return res.status(400).json({ error: "Text required" });
@@ -97,24 +97,34 @@ app.post("/analyze", async (req, res) => {
             parts: [
               {
                 text: `
-You are a STRICT JSON medical assistant.
+You are an expert medical assistant.
 
-Extract symptoms and medicines.
+Analyze patient text and return STRICT JSON.
 
 Text: ${text}
 
-Return ONLY JSON:
+Return:
 {
   "symptoms": [],
-  "medicines": []
+  "medicines": [],
+  "diet": [],
+  "exercise": [],
+  "precautions": []
 }
+
+Rules:
+- medicines should be common safe suggestions
+- include 2-4 medicines
+- include practical diet tips
+- include simple exercises/yoga
+- include precautions
                 `,
               },
             ],
           },
         ],
         generationConfig: {
-          temperature: 0.2,
+          temperature: 0.4,
         },
       }),
     });
@@ -131,9 +141,16 @@ Return ONLY JSON:
     try {
       aiResponse = JSON.parse(aiText);
     } catch {
-      aiResponse = { symptoms: [], medicines: [] };
+      aiResponse = {
+        symptoms: [],
+        medicines: [],
+        diet: [],
+        exercise: [],
+        precautions: [],
+      };
     }
 
+    /* 🔍 DB SEARCH */
     const learnedMedicines = await searchDoctorUsage(
       aiResponse.symptoms || []
     );
@@ -143,9 +160,21 @@ Return ONLY JSON:
         ? learnedMedicines
         : aiResponse.medicines || [];
 
+    /* 🔥 AUTO LEARNING (ONLY IF GEMINI USED) */
+    if (learnedMedicines.length === 0 && finalMedicines.length > 0) {
+      await updateDoctorUsage(
+        doctor_id,
+        aiResponse.symptoms,
+        finalMedicines
+      );
+    }
+
     return res.json({
       symptoms: aiResponse.symptoms || [],
       medicines: finalMedicines,
+      diet: aiResponse.diet || [],
+      exercise: aiResponse.exercise || [],
+      precautions: aiResponse.precautions || [],
     });
 
   } catch (error) {
