@@ -23,7 +23,7 @@ const MODEL = "gemini-2.5-flash";
 
 const normalize = (t) => t?.toLowerCase().trim();
 
-/* 🔍 DB SEARCH (Pehle DB se dhoondo - Fallback Logic) */
+/* 🔍 DB SEARCH (Fallback Logic) */
 async function searchDoctorUsage(symptoms, pathy) {
     let meds = [];
     for (const sym of symptoms) {
@@ -38,37 +38,26 @@ async function searchDoctorUsage(symptoms, pathy) {
     return [...new Set(meds)];
 }
 
-/* 💾 SMART UPDATE (Aadhe-adhure fields fill karne ke liye) */
+/* 💾 SMART UPDATE (Repairing doctor_uses) */
 async function updateDoctorUsage(doctor_id, pathy, symptoms, medicines) {
+    const batch = db.batch(); // Batch use kar rahe hain speed ke liye
     for (const sym of symptoms) {
         for (const med of medicines) {
-            const snap = await db.collection("doctor_uses")
-                .where("doctor_id", "==", doctor_id)
-                .where("symptom", "==", normalize(sym))
-                .where("medicine_name", "==", normalize(med))
-                .get();
+            // Unique ID banayi taaki duplicate docs na banein
+            const comboId = Buffer.from(`${normalize(sym)}_${normalize(med)}_${pathy}`).toString('base64').substring(0, 20);
+            const docRef = db.collection("doctor_uses").doc(comboId);
 
-            if (!snap.empty) {
-                // Purane docs mein missing fields yahan update honge
-                await snap.docs[0].ref.update({
-                    usage_count: admin.firestore.FieldValue.increment(1),
-                    doctor_pathy: pathy, 
-                    last_used: new Date(),
-                });
-            } else {
-                // Naya doc saare fields ke saath
-                await db.collection("doctor_uses").add({
-                    doctor_id,
-                    doctor_pathy: pathy,
-                    symptom: normalize(sym),
-                    medicine_name: normalize(med),
-                    usage_count: 1,
-                    created_at: new Date(),
-                    last_used: new Date(),
-                });
-            }
+            batch.set(docRef, {
+                doctor_id,
+                doctor_pathy: pathy,
+                symptom: normalize(sym),
+                medicine_name: normalize(med),
+                usage_count: admin.firestore.FieldValue.increment(1),
+                last_used: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
         }
     }
+    await batch.commit();
 }
 
 /* 🚀 ANALYZE API */
@@ -79,15 +68,27 @@ app.post("/analyze", async (req, res) => {
 
         const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
 
-        // Prompt mein Local Language aur Pathy dono set kar diye hain
-        const prompt = `You are an expert ${doctor_pathy} assistant. Analyze: "${text}". Extract symptoms in English. Medicines must be ${doctor_pathy}. Diet/Exercise must be in the patient's local language style. Return STRICT JSON: {"symptoms":[], "medicines":[], "diet":[], "exercise":[], "precautions":[]}`;
+        // 🔥 PROMPT UPDATED: Ab sab kuch English mein aayega (Global Standard)
+        const prompt = `You are a professional ${doctor_pathy} clinical assistant. 
+        Task: Analyze the patient's text and provide a structured medical summary.
+        Text: "${text}"
+        
+        STRICT RULES:
+        1. All output must be in ENGLISH only.
+        2. Symptoms must be clinical keywords.
+        3. Medicines must follow ${doctor_pathy} pathy.
+        4. Diet and Exercise should be professional and specific.
+        5. Return ONLY JSON.
+        
+        JSON Format:
+        {"symptoms":[], "medicines":[], "diet":[], "exercise":[], "precautions":[]}`;
 
         const response = await fetch(API_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: { temperature: 0.4 }
+                generationConfig: { temperature: 0.3 } // Lower temperature for more accuracy
             }),
         });
 
@@ -96,20 +97,22 @@ app.post("/analyze", async (req, res) => {
         aiText = aiText.replace(/```json|```/g, "").trim();
         const aiResponse = JSON.parse(aiText);
 
-        // 🔍 Check Database First (Fallback)
+        // 🔍 Check DB Fallback
         const dbMeds = await searchDoctorUsage(aiResponse.symptoms, doctor_pathy);
         let finalMedicines = dbMeds.length > 0 ? dbMeds : aiResponse.medicines;
 
-        // 🔥 Learning + Database Repairing
+        // 🔥 UPDATE DOCTOR_USES
         await updateDoctorUsage(doctor_id, doctor_pathy, aiResponse.symptoms, finalMedicines);
 
-        // Global learning collection
+        // 🧠 DEEP LEARNING COLLECTION (For Future AI Training)
         await db.collection("ai_learning").add({
             doctor_id,
             doctor_pathy,
-            text,
-            extracted: aiResponse,
-            timestamp: new Date()
+            input_text: text, // Raw patient input
+            structured_data: aiResponse, // JSON data from AI
+            final_medicines: finalMedicines,
+            engine_used: dbMeds.length > 0 ? "database" : "ai",
+            created_at: admin.firestore.FieldValue.serverTimestamp()
         });
 
         return res.json({
@@ -123,4 +126,4 @@ app.post("/analyze", async (req, res) => {
     }
 });
 
-app.listen(process.env.PORT || 3000, () => console.log("🔥 Zeqvex Engine Live"));
+app.listen(process.env.PORT || 3000, () => console.log("🚀 Zeqvex Engine Global Live"));
