@@ -9,142 +9,230 @@ dotenv.config();
 const app = express();
 app.use(cors(), express.json());
 
-// 🔑 FIREBASE INITIALIZATION
-let serviceAccount;
-try {
-    serviceAccount = process.env.FIREBASE_KEY 
-        ? JSON.parse(process.env.FIREBASE_KEY) 
-        : JSON.parse(fs.readFileSync("./firebase-key.json", "utf8"));
-} catch (err) {
-    console.error("❌ Firebase Init Error:", err.message);
+/* 🔥 FIREBASE INIT */
+const serviceAccount = process.env.FIREBASE_KEY
+  ? JSON.parse(process.env.FIREBASE_KEY)
+  : JSON.parse(fs.readFileSync("./firebase-key.json", "utf8"));
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
 }
 
-if (!admin.apps.length && serviceAccount) {
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-}
 const db = admin.firestore();
-
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-2.5-flash"; // ✅ Fixed to your preferred version
+const MODEL = "gemini-1.5-flash";
+
 const normalize = (t) => t?.toLowerCase().trim();
 
-/* 🔍 LOGIC 3: SYMPTOMS KEYWORDS (Bhasha Badalne Wali Machine) */
-async function syncSymptomKeywords(clinicalTerm, doctor_id) {
-    if (!clinicalTerm) return;
-    const termId = normalize(clinicalTerm).replace(/\s+/g, '_');
-    const symptomRef = db.collection("symptoms_keywords").doc(termId);
-    
-    // Naye symptoms ko doctor ID ke saath map karna
-    await symptomRef.set({
-        clinical_term: clinicalTerm,
-        last_doctor_id: doctor_id,
-        last_updated: admin.firestore.FieldValue.serverTimestamp()
+/* ===============================
+   🔹 GEMINI (ONLY WHEN NEEDED)
+================================ */
+async function callGemini(text, pathy) {
+  const prompt = `
+You are an expert ${pathy} doctor.
+
+Patient input:
+"${text}"
+
+Return JSON:
+{
+ "symptoms": [],
+ "medicines": [],
+ "diet": [],
+ "exercise": [],
+ "precautions": []
+}
+`;
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+      }),
+    }
+  );
+
+  const data = await res.json();
+  const txt = data.candidates[0].content.parts[0].text
+    .replace(/```json|```/g, "")
+    .trim();
+
+  return JSON.parse(txt);
+}
+
+/* ===============================
+   🔹 DB HELPERS
+================================ */
+async function getDoctorData(col, symptoms, doctor_id) {
+  let result = [];
+  for (const sym of symptoms) {
+    const snap = await db.collection(col)
+      .where("doctor_id", "==", doctor_id)
+      .where("symptom", "==", normalize(sym))
+      .get();
+
+    snap.forEach(d => result.push(d.data().value));
+  }
+  return [...new Set(result)];
+}
+
+async function getGlobalData(col, symptoms) {
+  let result = [];
+  for (const sym of symptoms) {
+    const snap = await db.collection(col)
+      .where("symptom", "==", normalize(sym))
+      .get();
+
+    snap.forEach(d => result.push(d.data().value));
+  }
+  return [...new Set(result)];
+}
+
+/* ===============================
+   🔹 SAVE SYMPTOMS
+================================ */
+async function saveSymptoms(symptoms, doctor_id) {
+  for (const s of symptoms) {
+    const id = `${doctor_id}_${normalize(s).replace(/\s+/g, "_")}`;
+    await db.collection("symptoms_keywords").doc(id).set({
+      symptom: normalize(s),
+      doctor_id,
     }, { merge: true });
+  }
 }
 
-/* 🔍 LOGIC 1: MEDICINES MASTER (Asli Medical Shop) */
-async function getAndSyncMedicine(medName, pathy, doctor_id) {
-    if (!medName) return { name: "Unknown", is_verified: false };
-    const medId = normalize(medName).replace(/\s+/g, '_');
-    const medRef = db.collection("medicines_master").doc(`${medId}_${pathy}`);
-    const doc = await medRef.get();
+/* ===============================
+   🔹 MEDICINE MASTER
+================================ */
+async function getMedicine(name, pathy, doctor_id) {
+  const id = normalize(name).replace(/\s+/g, "_");
+  const ref = db.collection("medicines_master").doc(`${id}_${pathy}`);
+  const doc = await ref.get();
 
-    if (doc.exists) {
-        const data = doc.data();
-        return {
-            name: medName,
-            potency: data.potency ? data.potency[0] : "Q",
-            dosage: data.common_dose || "As directed",
-            organ: data.organ || "General",
-            is_verified: true
-        };
-    } else {
-        // Assistant nayi dawai ko dukan mein add kar raha hai
-        await medRef.set({
-            name: medName,
-            name_lowercase: normalize(medName),
-            pathy: pathy,
-            added_by: doctor_id,
-            status: "new_entry",
-            created_at: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-        return { name: medName, potency: "New", dosage: "Review Needed", is_verified: false };
-    }
+  if (doc.exists) {
+    return { name, verified: true };
+  }
+
+  await ref.set({
+    name,
+    added_by: doctor_id,
+  });
+
+  return { name, verified: false };
 }
 
-/* 🚀 API: ANALYZE (Assistant ka Kaam) */
+/* ===============================
+   🚀 ANALYZE
+================================ */
 app.post("/analyze", async (req, res) => {
-    try {
-        const { text, doctor_id = "default_doc", doctor_pathy = "Allopathy" } = req.body;
-        if (!text) return res.status(400).json({ error: "No text provided" });
+  try {
+    const { text, doctor_id = "doc1", doctor_pathy = "Allopathy" } = req.body;
 
-        const prompt = `Analyze patient text: "${text}". Pathy: ${doctor_pathy}. Return ONLY STRICT JSON: {"symptoms":[], "medicines":[], "diet":[], "exercise":[], "precautions":[]}. No markdown, no prose.`;
-        
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-        });
+    if (!text) return res.status(400).json({ error: "No input" });
 
-        const data = await response.json();
-        
-        if (!data.candidates || data.candidates.length === 0) {
-            throw new Error("AI response empty or safety triggered");
-        }
+    // 🔹 ALWAYS Gemini for symptoms
+    const ai = await callGemini(text, doctor_pathy);
+    const symptoms = ai.symptoms || [];
 
-        let aiText = data.candidates[0].content.parts[0].text.replace(/```json|```/g, "").trim();
-        const aiResponse = JSON.parse(aiText);
+    await saveSymptoms(symptoms, doctor_id);
 
-        // Symptoms sync logic (Order 1)
-        for (const sym of aiResponse.symptoms) {
-            await syncSymptomKeywords(sym, doctor_id);
-        }
+    /* 🔥 MEDICINES */
+    let medicines =
+      await getDoctorData("doctor_uses", symptoms, doctor_id);
 
-        // Medicines master sync logic (Order 2)
-        let enrichedMeds = [];
-        for (const med of aiResponse.medicines) {
-            const detailedMed = await getAndSyncMedicine(med, doctor_pathy, doctor_id);
-            enrichedMeds.push(detailedMed);
-        }
+    if (medicines.length === 0)
+      medicines = await getGlobalData("doctor_uses", symptoms);
 
-        /* 🔍 LOGIC 4: AI LEARNING (Assistant ki Report Card) */
-        await db.collection("ai_learning").add({
-            doctor_id, doctor_pathy, input_text: text, output: aiResponse,
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
-        });
+    if (medicines.length === 0)
+      medicines = ai.medicines || [];
 
-        res.json({ ...aiResponse, medicines: enrichedMeds, engine: "Zeqvex-Vip-2.5-Final" });
+    /* 🔥 DIET */
+    let diet =
+      await getDoctorData("doctor_diet", symptoms, doctor_id);
 
-    } catch (e) {
-        res.status(500).json({ error: "Analyze Error", details: e.message });
+    if (diet.length === 0)
+      diet = await getGlobalData("doctor_diet", symptoms);
+
+    if (diet.length === 0)
+      diet = ai.diet || [];
+
+    /* 🔥 EXERCISE */
+    let exercise =
+      await getDoctorData("doctor_exercise", symptoms, doctor_id);
+
+    if (exercise.length === 0)
+      exercise = await getGlobalData("doctor_exercise", symptoms);
+
+    if (exercise.length === 0)
+      exercise = ai.exercise || [];
+
+    /* 🔥 PRECAUTIONS */
+    let precautions =
+      await getDoctorData("doctor_precautions", symptoms, doctor_id);
+
+    if (precautions.length === 0)
+      precautions = await getGlobalData("doctor_precautions", symptoms);
+
+    if (precautions.length === 0)
+      precautions = ai.precautions || [];
+
+    /* 🔹 SAVE NEW MEDICINES */
+    let finalMeds = [];
+    for (const m of medicines) {
+      const med = await getMedicine(m, doctor_pathy, doctor_id);
+      finalMeds.push(med);
     }
+
+    res.json({
+      symptoms,
+      medicines: finalMeds,
+      diet,
+      exercise,
+      precautions,
+    });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-/* 🚀 API: SAVE (LOGIC 2: Doctor ka Purana Tajurba) */
+/* ===============================
+   💾 SAVE PRESCRIPTION
+================================ */
 app.post("/save-prescription", async (req, res) => {
-    try {
-        const { doctor_id, doctor_pathy, symptoms, medicines } = req.body;
-        const batch = db.batch();
-        
-        // Doctor ke tajurbe ko dairy (doctor_uses) mein likhna
-        symptoms.forEach(sym => {
-            medicines.forEach(med => {
-                const medName = typeof med === 'string' ? med : med.name;
-                const comboId = Buffer.from(`${normalize(sym)}_${normalize(medName)}_${doctor_pathy}`).toString('base64').substring(0,25);
-                batch.set(db.collection("doctor_uses").doc(comboId), {
-                    doctor_id, doctor_pathy,
-                    symptom: normalize(sym),
-                    medicine_name: normalize(medName),
-                    usage_count: admin.firestore.FieldValue.increment(1),
-                    last_used: admin.firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
-            });
-        });
+  try {
+    const { doctor_id, symptoms, medicines, diet, exercise, precautions } = req.body;
 
-        await batch.commit();
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    const batch = db.batch();
+
+    const save = (col, value) => {
+      symptoms.forEach(sym => {
+        const id = `${doctor_id}_${normalize(sym)}_${normalize(value)}`;
+        batch.set(db.collection(col).doc(id), {
+          doctor_id,
+          symptom: normalize(sym),
+          value: normalize(value),
+        }, { merge: true });
+      });
+    };
+
+    medicines.forEach(m => save("doctor_uses", m.name || m));
+    diet?.forEach(d => save("doctor_diet", d));
+    exercise?.forEach(e => save("doctor_exercise", e));
+    precautions?.forEach(p => save("doctor_precautions", p));
+
+    await batch.commit();
+
+    res.json({ success: true });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 VIP Engine 2.5 Live - All Systems Synced`));
+app.listen(10000, () => console.log("🔥 Zeqvex Final Engine Running"));
