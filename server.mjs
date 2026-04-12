@@ -1,8 +1,8 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import fetch from "node-fetch";
 import admin from "firebase-admin";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
@@ -10,140 +10,209 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* 🔥 FIREBASE ADMIN SDK INIT */
-const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
-if (!admin.apps.length) {
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-    });
+/* 🔥 FIREBASE INIT (SAFE) */
+let serviceAccount;
+
+try {
+  serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+} catch (e) {
+  console.error("❌ FIREBASE_KEY missing or invalid");
+  process.exit(1);
 }
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
 const db = admin.firestore();
 
-/* 🔑 GEMINI AI CONFIG */
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+/* 🔑 GEMINI CONFIG */
+const API_KEY = process.env.GEMINI_API_KEY;
+const MODEL = "gemini-2.5-flash";
 
-/**
- * 🔍 SMART SEARCH: Search medicine based on symptoms & doctor's pathy
- */
-async function searchDoctorUsage(symptoms, pathy) {
-    let medicines = [];
-    for (const sym of symptoms) {
-        const snapshot = await db.collection("doctor_uses")
-            .where("symptom", "==", sym.toLowerCase())
-            .where("doctor_pathy", "==", pathy) // Only match same pathy
-            .orderBy("usage_count", "desc")
-            .limit(2)
-            .get();
-
-        snapshot.forEach((doc) => medicines.push(doc.data().medicine_name));
-    }
-    return [...new Set(medicines)];
+/* 🧠 NORMALIZE TEXT */
+function normalize(text) {
+  return text?.toLowerCase().trim();
 }
 
-/**
- * 💾 AUTO-LEARNING: Save successful combinations
- */
-async function updateDoctorUsage(doctor_id, pathy, symptoms, medicines) {
-    const batch = db.batch();
-    for (const sym of symptoms) {
-        for (const med of medicines) {
-            const comboId = Buffer.from(`${sym}_${med}_${pathy}`).toString('base64');
-            const docRef = db.collection("doctor_uses").doc(comboId);
-            
-            batch.set(docRef, {
-                doctor_id,
-                doctor_pathy: pathy,
-                symptom: sym.toLowerCase(),
-                medicine_name: med.toLowerCase(),
-                usage_count: admin.firestore.FieldValue.increment(1),
-                last_used: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        }
-    }
-    await batch.commit();
+/* 🔍 SEARCH FROM DB (SMART) */
+async function searchDoctorUsage(symptoms) {
+  let medicines = [];
+
+  for (const sym of symptoms) {
+    const snapshot = await db
+      .collection("doctor_uses")
+      .where("symptom", "==", normalize(sym))
+      .orderBy("usage_count", "desc")
+      .limit(3)
+      .get();
+
+    snapshot.forEach((doc) => {
+      medicines.push(doc.data().medicine_name);
+    });
+  }
+
+  return [...new Set(medicines)];
 }
 
-/* 🚀 ANALYZE API (GLOBAL & LOCAL SUPPORT) */
-app.post("/analyze", async (req, res) => {
-    try {
-        const { text, doctor_id, doctor_pathy = "Allopathy", country = "India" } = req.body;
+/* 💾 LEARNING SYSTEM */
+async function updateDoctorUsage(doctor_id, symptoms, medicines) {
+  for (const sym of symptoms) {
+    for (const med of medicines) {
+      const snapshot = await db
+        .collection("doctor_uses")
+        .where("doctor_id", "==", doctor_id)
+        .where("symptom", "==", normalize(sym))
+        .where("medicine_name", "==", normalize(med))
+        .get();
 
-        if (!text) return res.status(400).json({ error: "No text provided" });
+      if (!snapshot.empty) {
+        const doc = snapshot.docs[0];
 
-        // 1. Pathy & Location Specific Instructions
-        const systemInstruction = `
-        You are an expert medical assistant for a ${doctor_pathy} doctor in ${country}.
-        Analyze the patient text and extract symptoms.
-        
-        RULES:
-        1. If pathy is 'Electro-Homeopathy', suggest EH remedies (S1, F1, BE, etc.).
-        2. If pathy is 'Allopathy', suggest safe Generic medicines.
-        3. Support Local Languages: Extract keywords even if text is in Hinglish or Local Dialects.
-        4. Return clinical keywords in English for database matching.
-        5. Severity must be 'Low', 'Medium', or 'High'.
-        6. Medicines must be common in ${country}.
-        `;
-
-        const model = genAI.getGenerativeModel({
-            model: "gemini-1.5-flash",
-            systemInstruction: systemInstruction,
+        await doc.ref.update({
+          usage_count: admin.firestore.FieldValue.increment(1),
+          last_used: new Date(),
         });
+      } else {
+        await db.collection("doctor_uses").add({
+          doctor_id,
+          symptom: normalize(sym),
+          medicine_name: normalize(med),
+          usage_count: 1,
+          created_at: new Date(),
+          last_used: new Date(),
+        });
+      }
+    }
+  }
+}
 
-        // 2. Strict JSON Schema
-        const prompt = `
-        Analyze this text: "${text}"
-        Return JSON format:
+/* 🤖 GEMINI CALL */
+async function callGemini(text) {
+  const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
+
+  const response = await fetch(API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      contents: [
         {
-          "symptoms": ["English term"],
-          "medicines": ["Name Only"],
-          "diet": [],
-          "exercise": [],
-          "precautions": [],
-          "severity": ""
-        }`;
+          parts: [
+            {
+              text: `
+You are a STRICT medical assistant.
 
-        const result = await model.generateContent(prompt);
-        const response = await result.response;
-        let aiText = response.text().replace(/```json|```/g, "").trim();
-        const aiResponse = JSON.parse(aiText);
+Analyze text and return ONLY JSON.
 
-        // 3. Smart Search (Check if Doctor has used these before)
-        const learnedMedicines = await searchDoctorUsage(aiResponse.symptoms, doctor_pathy);
+Text: ${text}
 
-        // If we have learned medicines, prioritize them
-        const finalMedicines = learnedMedicines.length > 0 ? learnedMedicines : aiResponse.medicines;
+{
+  "symptoms": [],
+  "medicines": [],
+  "diet": [],
+  "exercise": [],
+  "precautions": []
+}
+              `,
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.3,
+      },
+    }),
+  });
 
-        // 4. Learning logic (If Gemini suggested new things)
-        if (learnedMedicines.length === 0 && finalMedicines.length > 0) {
-            await updateDoctorUsage(doctor_id, doctor_pathy, aiResponse.symptoms, finalMedicines);
-        }
+  const data = await response.json();
 
-        res.json({
-            ...aiResponse,
-            medicines: finalMedicines,
-            doctor_id,
-            doctor_pathy,
-            engine: learnedMedicines.length > 0 ? "Database" : "AI"
-        });
+  let aiText =
+    data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-    } catch (error) {
-        console.error("Analysis Error:", error);
-        res.status(500).json({ error: "Server Error", msg: error.message });
+  aiText = aiText.replace(/```json|```/g, "").trim();
+
+  try {
+    return JSON.parse(aiText);
+  } catch {
+    return {
+      symptoms: [],
+      medicines: [],
+      diet: [],
+      exercise: [],
+      precautions: [],
+    };
+  }
+}
+
+/* 🚀 MAIN API */
+app.post("/analyze", async (req, res) => {
+  try {
+    const { text, doctor_id = "default_doc" } = req.body;
+
+    if (!text) {
+      return res.status(400).json({ error: "Text required" });
     }
+
+    /* 🤖 STEP 1: GEMINI */
+    const ai = await callGemini(text);
+
+    /* 🧠 STEP 2: DB PRIORITY */
+    const dbMeds = await searchDoctorUsage(ai.symptoms || []);
+
+    const finalMedicines =
+      dbMeds.length > 0 ? dbMeds : ai.medicines || [];
+
+    /* 📈 STEP 3: AUTO LEARNING */
+    if (dbMeds.length === 0 && finalMedicines.length > 0) {
+      await updateDoctorUsage(
+        doctor_id,
+        ai.symptoms,
+        finalMedicines
+      );
+    }
+
+    return res.json({
+      symptoms: ai.symptoms || [],
+      medicines: finalMedicines,
+      diet: ai.diet || [],
+      exercise: ai.exercise || [],
+      precautions: ai.precautions || [],
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      error: "Server Error",
+      msg: error.message,
+    });
+  }
 });
 
-/* 💾 SAVE MANUAL PRESCRIPTION (Force Learning) */
+/* 💾 SAVE API */
 app.post("/save-prescription", async (req, res) => {
-    try {
-        const { doctor_id, doctor_pathy, symptoms, medicines } = req.body;
-        await updateDoctorUsage(doctor_id, doctor_pathy, symptoms, medicines);
-        res.json({ success: true, message: "Learned successfully" });
-    } catch (error) {
-        res.status(500).json({ error: "Save failed", msg: error.message });
+  try {
+    const { doctor_id, symptoms, medicines } = req.body;
+
+    if (!doctor_id || !symptoms || !medicines) {
+      return res.status(400).json({ error: "Missing data" });
     }
+
+    await updateDoctorUsage(doctor_id, symptoms, medicines);
+
+    return res.json({ success: true });
+
+  } catch (error) {
+    res.status(500).json({
+      error: "Save failed",
+      msg: error.message,
+    });
+  }
 });
 
+/* 🚀 START */
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-    console.log(`🔥 Zeqvex Global Engine Live on Port ${PORT}`);
+  console.log(`🔥 Server running on ${PORT}`);
 });
