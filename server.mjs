@@ -10,7 +10,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* 🔥 FIREBASE INIT (SAFE) */
+/* 🔥 FIREBASE INIT */
 let serviceAccount;
 
 try {
@@ -30,12 +30,35 @@ const db = admin.firestore();
 const API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = "gemini-2.5-flash";
 
-/* 🧠 NORMALIZE TEXT */
+/* 🧠 NORMALIZE */
 function normalize(text) {
   return text?.toLowerCase().trim();
 }
 
-/* 🔍 SEARCH FROM DB (SMART) */
+/* 💀 DEFAULT FILL (IMPORTANT) */
+function fillDefaults(data) {
+  return {
+    symptoms: data.symptoms || [],
+    medicines: data.medicines || [],
+
+    diet:
+      data.diet && data.diet.length > 0
+        ? data.diet
+        : ["Drink warm water", "Eat light food", "Avoid oily food"],
+
+    exercise:
+      data.exercise && data.exercise.length > 0
+        ? data.exercise
+        : ["Light stretching", "Proper rest"],
+
+    precautions:
+      data.precautions && data.precautions.length > 0
+        ? data.precautions
+        : ["Avoid heavy work", "Take proper rest"],
+  };
+}
+
+/* 🔍 DB SEARCH */
 async function searchDoctorUsage(symptoms) {
   let medicines = [];
 
@@ -104,9 +127,11 @@ async function callGemini(text) {
               text: `
 You are a STRICT medical assistant.
 
-Analyze text and return ONLY JSON.
+Extract structured medical data.
 
 Text: ${text}
+
+Return ONLY JSON:
 
 {
   "symptoms": [],
@@ -146,7 +171,7 @@ Text: ${text}
   }
 }
 
-/* 🚀 MAIN API */
+/* 🚀 ANALYZE API */
 app.post("/analyze", async (req, res) => {
   try {
     const { text, doctor_id = "default_doc" } = req.body;
@@ -155,16 +180,16 @@ app.post("/analyze", async (req, res) => {
       return res.status(400).json({ error: "Text required" });
     }
 
-    /* 🤖 STEP 1: GEMINI */
+    /* STEP 1: AI */
     const ai = await callGemini(text);
 
-    /* 🧠 STEP 2: DB PRIORITY */
+    /* STEP 2: DB */
     const dbMeds = await searchDoctorUsage(ai.symptoms || []);
 
     const finalMedicines =
       dbMeds.length > 0 ? dbMeds : ai.medicines || [];
 
-    /* 📈 STEP 3: AUTO LEARNING */
+    /* STEP 3: LEARNING */
     if (dbMeds.length === 0 && finalMedicines.length > 0) {
       await updateDoctorUsage(
         doctor_id,
@@ -173,13 +198,13 @@ app.post("/analyze", async (req, res) => {
       );
     }
 
-    return res.json({
-      symptoms: ai.symptoms || [],
+    /* STEP 4: FINAL OUTPUT */
+    const finalData = fillDefaults({
+      ...ai,
       medicines: finalMedicines,
-      diet: ai.diet || [],
-      exercise: ai.exercise || [],
-      precautions: ai.precautions || [],
     });
+
+    return res.json(finalData);
 
   } catch (error) {
     res.status(500).json({
@@ -210,7 +235,7 @@ app.post("/save-prescription", async (req, res) => {
   }
 });
 
-/* 🚀 START */
+/* 🚀 START SERVER */
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
