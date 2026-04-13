@@ -22,17 +22,21 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-1.5-flash"; // ✅ FIXED MODEL
+const MODEL = "gemini-1.5-flash";
 
 const normalize = (t) => t?.toLowerCase().trim();
 const localCache = new Map();
 
-/* 🔥 SAFE JSON PARSER */
+/* 🔥 ULTRA SAFE JSON PARSER */
 function safeJSON(txt) {
   try {
     if (!txt) throw new Error("Empty response");
 
-    let clean = txt.replace(/```json/g, "").replace(/```/g, "").trim();
+    let clean = txt
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .replace(/\n/g, "")
+      .trim();
 
     const start = clean.indexOf("{");
     const end = clean.lastIndexOf("}");
@@ -44,7 +48,7 @@ function safeJSON(txt) {
 
     throw new Error("No JSON found");
   } catch (e) {
-    console.error("❌ JSON Parsing failed:", txt);
+    console.error("❌ JSON ERROR RAW:", txt);
     return {
       symptoms: ["Analysis Error"],
       diagnosis: "Formatting Issue",
@@ -60,10 +64,11 @@ function safeJSON(txt) {
 const MASTER_PROMPT = `
 Act as a world-class diagnostic expert.
 
-1. Support all languages. Output MUST be English.
-2. Electrohomeopathy only if pathy matches (S1, F1, etc)
-3. Otherwise normal medicines
-4. RETURN ONLY PURE JSON
+1. Understand any Indian language.
+2. Output MUST be English.
+3. Use Electrohomeopathy only if needed (S1, F1, etc)
+4. Otherwise normal medicines
+5. RETURN STRICT JSON ONLY
 
 {
   "symptoms": [],
@@ -75,7 +80,7 @@ Act as a world-class diagnostic expert.
 }
 `;
 
-/* 🔥 GEMINI FIXED CALL */
+/* 🔥 FIXED GEMINI CALL */
 async function callGemini(text, pathy) {
   try {
     const prompt = `Pathy: ${pathy}\nPatient: ${text}\n${MASTER_PROMPT}`;
@@ -98,17 +103,25 @@ async function callGemini(text, pathy) {
 
     const data = await res.json();
 
-    const txt =
-      data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-      data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data ||
-      "";
+    // 🔥 FIX: HANDLE ALL POSSIBLE RESPONSE STRUCTURES
+    let txt = "";
 
+    if (data?.candidates?.length) {
+      const parts = data.candidates[0].content?.parts || [];
+
+      for (const p of parts) {
+        if (p.text) txt += p.text;
+      }
+    }
+
+    // 🔥 DEBUG (IMPORTANT)
     if (!txt) {
-      console.error("❌ Gemini EMPTY RESPONSE:", data);
+      console.error("❌ GEMINI FULL RESPONSE:", JSON.stringify(data, null, 2));
       return safeJSON("");
     }
 
     return safeJSON(txt);
+
   } catch (e) {
     console.error("❌ Gemini Error:", e.message);
     return safeJSON("");
@@ -184,7 +197,9 @@ app.post("/analyze", async (req, res) => {
     localCache.set(cacheKey, finalData);
 
     res.json(finalData);
+
   } catch (e) {
+    console.error("❌ ANALYZE ERROR:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -233,7 +248,9 @@ app.post("/save-prescription", async (req, res) => {
     await batch.commit();
 
     res.json({ success: true });
+
   } catch (e) {
+    console.error("❌ SAVE ERROR:", e);
     res.status(500).json({ error: e.message });
   }
 });
