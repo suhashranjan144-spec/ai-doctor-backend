@@ -27,50 +27,54 @@ const MODEL = "gemini-2.5-flash";
 const normalize = (t) => t?.toLowerCase().trim();
 const localCache = new Map();
 
-/* 🔥 SAFE JSON PARSER */
+/* 🔥 SUPER SAFE JSON PARSER (Fixed the Format Error) */
 function safeJSON(txt) {
   try {
-    const cleanTxt = txt.replace(/```json/g, "").replace(/```/g, "").trim();
-    return JSON.parse(cleanTxt);
+    // Step 1: Remove markdown blocks
+    let clean = txt.replace(/```json/g, "").replace(/```/g, "").trim();
+    
+    // Step 2: Find the first '{' and last '}' (This extracts ONLY the JSON part)
+    const start = clean.indexOf('{');
+    const end = clean.lastIndexOf('}');
+    
+    if (start !== -1 && end !== -1) {
+      clean = clean.substring(start, end + 1);
+    }
+    
+    return JSON.parse(clean);
   } catch (e) {
-    console.error("JSON Parse Error:", e);
+    console.error("Failed to parse JSON. Raw text was:", txt);
+    // Returning a fallback so the app doesn't break
     return { 
-      symptoms: [], diagnosis: "Format Error", medicines: [], 
+      symptoms: ["Analysis Error"], 
+      diagnosis: "Formatting Issue - Please try again", 
+      medicines: [], 
       diet: [], exercise: [], precautions: [] 
     };
   }
 }
 
-/* 🔥 ULTIMATE DOCTOR PROMPT (Fixed for 2.5 Flash) */
-const MASTER_PROMPT = `
-You are a world-class diagnostic and prescription expert. 
-Your goal is to act as a specialist doctor for the requested "doctor_pathy".
+/* 🔥 MASTER PROMPT (Ultra Strict) */
+const MASTER_PROMPT = `Act as a world-class doctor.
+Rules:
+1. Patient may use any language (Marathi/Hindi/Hinglish).
+2. Translate everything to Medical English.
+3. STRICTLY follow the doctor_pathy requested.
+4. Respond ONLY with a valid JSON object. No intro, no outro.
 
-STRICT OPERATING PROCEDURES:
-1. LANGUAGE: Patients may use local languages (Hindi, Marathi, Hinglish). You must translate these accurately to professional medical English.
-2. DIAGNOSIS: Provide a concise, clinical diagnosis based on the symptoms.
-3. PATHY LOGIC: 
-   - If pathy is "Electro_Homeopathy", use only EH remedies (e.g., S1, F1, A2, etc.).
-   - For Allopathy, use standard clinical drugs.
-4. COMPLETENESS: Never return empty lists if symptoms are provided. Suggest the most effective safe treatments.
-5. OUTPUT: Return ONLY a valid JSON object. No conversational text.
-
-STRUCTURE:
+Format:
 {
-  "symptoms": ["Professional term 1", "Professional term 2"],
-  "diagnosis": "Clinical Diagnosis Name",
-  "medicines": [
-    {"name": "Full Name", "type": "primary", "pathy": "pathy_name", "dosage": "e.g. 5 drops 3 times a day", "duration": "e.g. 7 days"}
-  ],
-  "diet": ["specific food advice"],
-  "exercise": ["physical activity advice"],
-  "precautions": ["safety warnings"]
-}
-`;
+  "symptoms": [],
+  "diagnosis": "",
+  "medicines": [{"name": "", "type": "primary", "pathy": "", "dosage": "", "duration": ""}],
+  "diet": [],
+  "exercise": [],
+  "precautions": []
+}`;
 
-/* 🔥 GEMINI API CALLER */
+/* 🔥 GEMINI CALLER */
 async function callGemini(text, pathy, imageData = null) {
-  const prompt = `Requested Pathy: ${pathy}\nPatient Complaint: ${text}\n\n${MASTER_PROMPT}`;
+  const prompt = `Requested Pathy: ${pathy}\nPatient Data: ${text}\n\n${MASTER_PROMPT}`;
   const payload = {
     contents: [{
       parts: [
@@ -87,9 +91,13 @@ async function callGemini(text, pathy, imageData = null) {
       body: JSON.stringify(payload),
     });
     const data = await res.json();
+    
+    // Debugging: Render logs mein asli text dikhega
     const txt = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
     return safeJSON(txt);
-  } catch (e) { return safeJSON(""); }
+  } catch (e) { 
+    return safeJSON(""); 
+  }
 }
 
 /* 🔥 1. SYMPTOMS MAPPING */
@@ -104,9 +112,10 @@ async function mapSymptoms(input) {
   return [...result];
 }
 
-/* 🔥 2. DATABASE SEARCH & RANKING */
+/* 🔥 2. DATABASE SEARCH */
 async function getFromDB(symptoms, pathy) {
   const map = new Map();
+  if (symptoms.length === 0) return [];
   for (const sym of symptoms) {
     const snap = await db.collection("medicine_master")
       .where("pathy", "==", pathy)
@@ -114,14 +123,10 @@ async function getFromDB(symptoms, pathy) {
       .get();
     snap.forEach(d => map.set(d.id, d.data()));
   }
-  return [...map.values()].map(m => {
-    let score = (m.usage_count || 0) * 2;
-    if (m.verified) score += 10; // Extra weight for doctor verified
-    return { ...m, score };
-  }).sort((a, b) => b.score - a.score);
+  return [...map.values()];
 }
 
-/* 🔥 3. ANALYZE TEXT (Smart Logic) */
+/* 🔥 3. ANALYZE (Smart Logic) */
 app.post("/analyze", async (req, res) => {
   try {
     const { text, doctor_pathy = "allopathy" } = req.body;
@@ -133,20 +138,17 @@ app.post("/analyze", async (req, res) => {
     
     let finalData;
 
-    // 🔥 RULE: Agar hamare DB mein 3 Verified records hain, toh Gemini bypass karo
     if (dbMeds.length >= 3) {
-      console.log("🚀 SUCCESS: Using Zeqvex Internal Knowledge Base");
       finalData = {
-        symptoms: symptoms.length > 0 ? symptoms : ["Identified from History"],
-        diagnosis: "Confirmed via clinical records",
+        symptoms: symptoms,
+        diagnosis: "Verified via clinical records",
         medicines: dbMeds,
-        diet: ["Follow standard protocol"],
-        exercise: ["As previously advised"],
-        precautions: ["Standard precautions"],
+        diet: ["Follow pathy protocol"],
+        exercise: ["As advised"],
+        precautions: ["Standard safety tips"],
         source: "local_db"
       };
     } else {
-      console.log("🤖 AI MODE: Learning from Gemini...");
       const ai = await callGemini(text, doctor_pathy);
       finalData = { ...ai, source: "gemini" };
     }
@@ -157,12 +159,11 @@ app.post("/analyze", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* 🔥 4. SAVE PRESCRIPTION (The Learning Engine) */
+/* 🔥 4. SAVE PRESCRIPTION */
 app.post("/save-prescription", async (req, res) => {
   try {
     const { prescription_id, doctor_id, patient_id, doctor_pathy, medicines, symptoms, source } = req.body;
 
-    // 1. Save Transactional Record
     await db.collection("prescriptions").doc(prescription_id).set({
       doctor_id, patient_id, doctor_pathy, medicines, symptoms, source, created_at: new Date()
     });
@@ -170,29 +171,22 @@ app.post("/save-prescription", async (req, res) => {
     const batch = db.batch();
     medicines.forEach(m => {
       const name = normalize(m.name);
-
-      // 2. Log Usage for Analytics
       batch.set(db.collection("doctor_uses").doc(), {
         doctor_id, medicine_name: name, symptoms, doctor_pathy, 
-        type: source, created_at: new Date(), usage_count: 1
+        type: source, created_at: new Date()
       });
 
-      // 3. 🔥 UPDATE MASTER DB (Power Up)
-      // Jab doctor Gemini ko edit kare ya apni dawai direct de, tab hamara DB strong hota hai
       if (source === "direct" || source === "edited") {
         batch.set(db.collection("medicine_master").doc(name), {
-          name, 
-          pathy: doctor_pathy, 
-          symptoms: symptoms, // Is bimari ke liye ye dawai link ho gayi
-          usage_count: admin.firestore.FieldValue.increment(5), // Isse iski priority badhegi
-          verified: true, 
-          updated_at: new Date()
+          name, pathy: doctor_pathy, symptoms: symptoms,
+          usage_count: admin.firestore.FieldValue.increment(5),
+          verified: true, updated_at: new Date()
         }, { merge: true });
       }
     });
 
     await batch.commit();
-    res.json({ success: true, pdf_url: `https://zeqvex.com/print/${prescription_id}` });
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -220,4 +214,4 @@ app.post("/patient-history", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 ZEQVEX v1.6 LIVE ON PORT ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 ZEQVEX v1.6.1 LIVE ON PORT ${PORT}`));
