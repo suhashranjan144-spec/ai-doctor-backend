@@ -27,34 +27,40 @@ const MODEL = "gemini-2.5-flash";
 const normalize = (t) => t?.toLowerCase().trim();
 const localCache = new Map();
 
-/* 🔥 SUPER SAFE JSON PARSER */
+/* 🔥 SUPER SAFE JSON PARSER (Fixed Format Error) */
 function safeJSON(txt) {
   try {
+    // Markdown code blocks hatane ke liye
     let clean = txt.replace(/```json/g, "").replace(/```/g, "").trim();
+    
+    // Sirf '{' se '}' tak ka hissa uthane ke liye (Extra text ignore karne ke liye)
     const start = clean.indexOf('{');
     const end = clean.lastIndexOf('}');
+    
     if (start !== -1 && end !== -1) {
       clean = clean.substring(start, end + 1);
+      return JSON.parse(clean);
     }
-    return JSON.parse(clean);
+    throw new Error("No JSON found");
   } catch (e) {
-    console.error("JSON Error Raw:", txt);
+    console.error("JSON Parsing failed. Text was:", txt);
     return { 
       symptoms: ["Analysis Error"], 
-      diagnosis: "Format Issue", 
+      diagnosis: "Formatting Issue", 
       medicines: [], 
       diet: [], exercise: [], precautions: [] 
     };
   }
 }
 
-/* 🔥 MASTER PROMPT (Electro-Homeopathy + Multi-Language Support) */
+/* 🔥 MASTER PROMPT (Barkaraar Logic: Language + EH Specialist) */
 const MASTER_PROMPT = `
 Act as a world-class diagnostic expert. 
-1. Support all languages (Hindi, Marathi, Bengali, Gujarati). Output MUST be in English.
-2. If doctor_pathy is "electrohomeopathy" or "electro_homeopathy"or "eh" or "electropathy"or "electro_pathy": Strictly use EH remedies like S1, F1, A2, C5, L1, BE, WE, RE, etc.
+1. Support all languages (Hindi, Marathi, Bengali, Gujarati, etc.). Output MUST be in English.
+2. If doctor_pathy is "electrohomeopathy", "electro_homeopathy", "eh", "electropathy", or "electro_pathy": 
+   STRICTLY use Electro-Homeopathy remedies like S1, F1, A2, C5, L1, BE, WE, RE, etc.
 3. If doctor_pathy is "allopathy" or others: Use relevant standard medicines.
-4. Return ONLY a valid raw JSON object. No conversational text.
+4. Return ONLY a valid raw JSON object. Do not include any introductory or concluding text.
 
 Format:
 {
@@ -73,7 +79,10 @@ async function callGemini(text, pathy) {
     const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      body: JSON.stringify({ 
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { response_mime_type: "application/json" } // Force JSON mode
+      }),
     });
     const data = await res.json();
     const txt = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
@@ -84,7 +93,7 @@ async function callGemini(text, pathy) {
   }
 }
 
-/* 🔥 1. SYMPTOMS MAPPING (Knowledge Base) */
+/* 🔥 1. SYMPTOMS MAPPING */
 async function mapSymptoms(input) {
   input = input.toLowerCase();
   const result = new Set();
@@ -96,7 +105,7 @@ async function mapSymptoms(input) {
   return [...result];
 }
 
-/* 🔥 2. DATABASE SEARCH (Medicine Master) */
+/* 🔥 2. DATABASE SEARCH */
 async function getFromDB(symptoms, pathy) {
   const map = new Map();
   if (symptoms.length === 0) return [];
@@ -110,7 +119,7 @@ async function getFromDB(symptoms, pathy) {
   return [...map.values()];
 }
 
-/* 🔥 3. ANALYZE (Puchne Ke Liye - Does NOT save to DB) */
+/* 🔥 3. ANALYZE (Puchne Ke Liye) */
 app.post("/analyze", async (req, res) => {
   try {
     const { text, doctor_pathy = "allopathy" } = req.body;
@@ -137,21 +146,19 @@ app.post("/analyze", async (req, res) => {
       finalData = { ...ai, source: "gemini" };
     }
 
-    // Temporary ID generate ho raha hai, save nahi
     finalData.prescription_id = db.collection("prescriptions").doc().id;
     localCache.set(cacheKey, finalData);
     res.json(finalData);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* 🔥 4. SAVE PRESCRIPTION (Likne Ke Liye - Database Update) */
+/* 🔥 4. SAVE PRESCRIPTION (Likne Ke Liye) */
 app.post("/save-prescription", async (req, res) => {
   try {
     const { prescription_id, doctor_id, patient_id, doctor_pathy, medicines, symptoms, source } = req.body;
 
     if (!prescription_id) return res.status(400).json({ error: "prescription_id missing" });
 
-    // A. Prescriptions collection mein save karo
     await db.collection("prescriptions").doc(prescription_id).set({
       doctor_id, patient_id, doctor_pathy, medicines, symptoms, source,
       created_at: new Date()
@@ -161,12 +168,10 @@ app.post("/save-prescription", async (req, res) => {
     medicines.forEach(m => {
       const name = normalize(m.name);
       
-      // B. Doctor Uses tracking entry
       batch.set(db.collection("doctor_uses").doc(), {
         doctor_id, medicine_name: name, symptoms, doctor_pathy, type: source, created_at: new Date()
       });
 
-      // C. Medicine Master Strong Banana (If doctor confirms)
       if (source === "direct" || source === "edited") {
         batch.set(db.collection("medicine_master").doc(name), {
           name, pathy: doctor_pathy, symptoms: symptoms,
