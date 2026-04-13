@@ -27,80 +27,64 @@ const MODEL = "gemini-2.5-flash";
 const normalize = (t) => t?.toLowerCase().trim();
 const localCache = new Map();
 
-/* 🔥 SUPER SAFE JSON PARSER (Fixed the Format Error) */
+/* 🔥 SUPER SAFE JSON PARSER */
 function safeJSON(txt) {
   try {
-    // Step 1: Remove markdown blocks
     let clean = txt.replace(/```json/g, "").replace(/```/g, "").trim();
-    
-    // Step 2: Find the first '{' and last '}' (This extracts ONLY the JSON part)
     const start = clean.indexOf('{');
     const end = clean.lastIndexOf('}');
-    
     if (start !== -1 && end !== -1) {
       clean = clean.substring(start, end + 1);
     }
-    
     return JSON.parse(clean);
   } catch (e) {
-    console.error("Failed to parse JSON. Raw text was:", txt);
-    // Returning a fallback so the app doesn't break
+    console.error("JSON Error Raw:", txt);
     return { 
       symptoms: ["Analysis Error"], 
-      diagnosis: "Formatting Issue - Please try again", 
+      diagnosis: "Format Issue", 
       medicines: [], 
       diet: [], exercise: [], precautions: [] 
     };
   }
 }
 
-/* 🔥 MASTER PROMPT (Ultra Strict) */
-const MASTER_PROMPT = `Act as a world-class doctor.
-Rules:
-1. Patient may use any language (Marathi/Hindi/Hinglish).
-2. Translate everything to Medical English.
-3. STRICTLY follow the doctor_pathy requested.
-4. Respond ONLY with a valid JSON object. No intro, no outro.
+/* 🔥 MASTER PROMPT (Electro-Homeopathy + Multi-Language Support) */
+const MASTER_PROMPT = `
+Act as a world-class diagnostic expert. 
+1. Support all languages (Hindi, Marathi, Bengali, Gujarati). Output MUST be in English.
+2. If doctor_pathy is "electrohomeopathy" or "electro_homeopathy"or "eh" or "electropathy"or "electro_pathy": Strictly use EH remedies like S1, F1, A2, C5, L1, BE, WE, RE, etc.
+3. If doctor_pathy is "allopathy" or others: Use relevant standard medicines.
+4. Return ONLY a valid raw JSON object. No conversational text.
 
 Format:
 {
-  "symptoms": [],
-  "diagnosis": "",
-  "medicines": [{"name": "", "type": "primary", "pathy": "", "dosage": "", "duration": ""}],
-  "diet": [],
-  "exercise": [],
-  "precautions": []
+  "symptoms": ["Professional Term 1", "Professional Term 2"],
+  "diagnosis": "Clinical Diagnosis Name",
+  "medicines": [{"name": "Medicine Name", "type": "primary", "pathy": "Pathy Name", "dosage": "Exact Dose", "duration": "Days"}],
+  "diet": ["Advice 1"],
+  "exercise": ["Advice 1"],
+  "precautions": ["Advice 1"]
 }`;
 
 /* 🔥 GEMINI CALLER */
-async function callGemini(text, pathy, imageData = null) {
-  const prompt = `Requested Pathy: ${pathy}\nPatient Data: ${text}\n\n${MASTER_PROMPT}`;
-  const payload = {
-    contents: [{
-      parts: [
-        { text: prompt },
-        ...(imageData ? [{ inline_data: { mime_type: "image/jpeg", data: imageData } }] : [])
-      ]
-    }]
-  };
-
+async function callGemini(text, pathy) {
+  const prompt = `Requested Pathy: ${pathy}\nPatient Input: ${text}\n\n${MASTER_PROMPT}`;
   try {
     const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
     });
     const data = await res.json();
-    
-    // Debugging: Render logs mein asli text dikhega
     const txt = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
     return safeJSON(txt);
   } catch (e) { 
+    console.error("Gemini API Call Error:", e);
     return safeJSON(""); 
   }
 }
 
-/* 🔥 1. SYMPTOMS MAPPING */
+/* 🔥 1. SYMPTOMS MAPPING (Knowledge Base) */
 async function mapSymptoms(input) {
   input = input.toLowerCase();
   const result = new Set();
@@ -112,7 +96,7 @@ async function mapSymptoms(input) {
   return [...result];
 }
 
-/* 🔥 2. DATABASE SEARCH */
+/* 🔥 2. DATABASE SEARCH (Medicine Master) */
 async function getFromDB(symptoms, pathy) {
   const map = new Map();
   if (symptoms.length === 0) return [];
@@ -126,7 +110,7 @@ async function getFromDB(symptoms, pathy) {
   return [...map.values()];
 }
 
-/* 🔥 3. ANALYZE (Smart Logic) */
+/* 🔥 3. ANALYZE (Puchne Ke Liye - Does NOT save to DB) */
 app.post("/analyze", async (req, res) => {
   try {
     const { text, doctor_pathy = "allopathy" } = req.body;
@@ -153,29 +137,36 @@ app.post("/analyze", async (req, res) => {
       finalData = { ...ai, source: "gemini" };
     }
 
+    // Temporary ID generate ho raha hai, save nahi
     finalData.prescription_id = db.collection("prescriptions").doc().id;
     localCache.set(cacheKey, finalData);
     res.json(finalData);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* 🔥 4. SAVE PRESCRIPTION */
+/* 🔥 4. SAVE PRESCRIPTION (Likne Ke Liye - Database Update) */
 app.post("/save-prescription", async (req, res) => {
   try {
     const { prescription_id, doctor_id, patient_id, doctor_pathy, medicines, symptoms, source } = req.body;
 
+    if (!prescription_id) return res.status(400).json({ error: "prescription_id missing" });
+
+    // A. Prescriptions collection mein save karo
     await db.collection("prescriptions").doc(prescription_id).set({
-      doctor_id, patient_id, doctor_pathy, medicines, symptoms, source, created_at: new Date()
+      doctor_id, patient_id, doctor_pathy, medicines, symptoms, source,
+      created_at: new Date()
     });
 
     const batch = db.batch();
     medicines.forEach(m => {
       const name = normalize(m.name);
+      
+      // B. Doctor Uses tracking entry
       batch.set(db.collection("doctor_uses").doc(), {
-        doctor_id, medicine_name: name, symptoms, doctor_pathy, 
-        type: source, created_at: new Date()
+        doctor_id, medicine_name: name, symptoms, doctor_pathy, type: source, created_at: new Date()
       });
 
+      // C. Medicine Master Strong Banana (If doctor confirms)
       if (source === "direct" || source === "edited") {
         batch.set(db.collection("medicine_master").doc(name), {
           name, pathy: doctor_pathy, symptoms: symptoms,
@@ -186,8 +177,12 @@ app.post("/save-prescription", async (req, res) => {
     });
 
     await batch.commit();
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({ success: true, message: "Data successfully saved in Console!" });
+
+  } catch (e) { 
+    console.error("Save Error:", e.message);
+    res.status(500).json({ success: false, error: e.message }); 
+  }
 });
 
 /* 🔐 5. ACCESS & HISTORY */
@@ -214,4 +209,4 @@ app.post("/patient-history", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 ZEQVEX v1.6.1 LIVE ON PORT ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 ZEQVEX v1.7.0 LIVE ON PORT ${PORT}`));
