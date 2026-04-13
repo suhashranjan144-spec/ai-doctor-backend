@@ -1,4 +1,4 @@
-import express from "express";
+To kya mere code import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
@@ -7,245 +7,190 @@ import fs from "fs";
 
 dotenv.config();
 const app = express();
-app.use(cors(), express.json());
+app.use(cors(), express.json({ limit: '50mb' })); // Large size for image analysis
 
 /* 🔥 FIREBASE INIT */
 const serviceAccount = process.env.FIREBASE_KEY
-  ? JSON.parse(process.env.FIREBASE_KEY)
-  : JSON.parse(fs.readFileSync("./firebase-key.json", "utf8"));
+  ? JSON.parse(process.env.FIREBASE_KEY)
+  : JSON.parse(fs.readFileSync("./firebase-key.json", "utf8"));
 
 if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
 }
 
 const db = admin.firestore();
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-2.5-flash";
+const MODEL = "gemini-2.0-flash"; // Optimized for Vision & Speed
 
 const normalize = (t) => t?.toLowerCase().trim();
+const OTP_EXPIRY_MS = 5 * 60 * 1000;
 
-/* 🔥 GEMINI */
-async function callGemini(text, pathy) {
-  const prompt = `
-You are an expert ${pathy} doctor.
+/* 🔥 CACHE SYSTEM (Saves money and time) */
+const localCache = new Map();
 
-Return STRICT JSON:
+/* 🔥 SAFE JSON */
+function safeJSON(txt) {
+  try {
+    return JSON.parse(txt);
+  } catch {
+    return { symptoms: [], diagnosis: "", medicines: [], diet: [], exercise: [], precautions: [] };
+  }
+}
+
+/* 🔥 MASTER PROMPT */
+const MASTER_PROMPT = `
+You are a highly experienced and globally trained medical doctor.
+IMPORTANT RULES:
+1. forstå/understand any language, but respond in PROFESSIONAL MEDICAL ENGLISH.
+2. PATHY LOGIC: Respect the requested doctor_pathy (Allopathy, Ayurveda, Homeopathy, Electro_Homeopathy).
+3. Return STRICT JSON only.
 {
- "symptoms": [],
- "clinical_terms": [],
- "medicines": [],
- "diet": [],
- "exercise": [],
- "precautions": []
-}`;
+"symptoms": [], "diagnosis": "",
+"medicines": [{"name": "", "type": "primary", "pathy": "", "dosage": "", "duration": ""}],
+"diet": [], "exercise": [], "precautions": []
+}
+`;
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: text + "\n" + prompt }] }],
-      }),
-    }
-  );
+/* 🔥 GEMINI CALL */
+async function callGemini(text, pathy, imageData = null) {
+  const prompt = `Context: ${pathy} doctor. \n ${MASTER_PROMPT}`;
+  
+  const payload = {
+    contents: [{
+      parts: [
+        { text: text + "\n" + prompt },
+        ...(imageData ? [{ inline_data: { mime_type: "image/jpeg", data: imageData } }] : [])
+      ]
+    }]
+  };
 
-  const data = await res.json();
-  let txt = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  txt = txt.replace(/```json|```/g, "").trim();
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
 
-  return JSON.parse(txt);
+    const data = await res.json();
+    let txt = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    txt = txt.replace(/```json|```/g, "").trim();
+    return safeJSON(txt);
+  } catch { return safeJSON(""); }
 }
 
-/* 🔥 SMART RANK */
-function rankResults(ai, dbData) {
-  const map = new Map();
+/* 🔥 UPGRADE 1: ANALYZE LAB REPORTS (VISION) */
+app.post("/analyze-report", async (req, res) => {
+  try {
+    const { image_base64, doctor_pathy = "allopathy" } = req.body;
+    if (!image_base64) return res.status(400).json({ error: "Image data required" });
 
-  dbData.forEach(item => {
-    map.set(item, (map.get(item) || 0) + 5);
-  });
+    const ai = await callGemini("Analyze this medical report/image and provide diagnosis.", doctor_pathy, image_base64);
+    res.json(ai);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-  ai.forEach(item => {
-    map.set(item, (map.get(item) || 0) + 1);
-  });
-
-  return [...map.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(x => x[0])
-    .slice(0, 5);
+/* 🔥 SYMPTOMS KEYWORD MAPPING */
+async function mapSymptoms(input) {
+  input = input.toLowerCase();
+  const result = new Set();
+  const snap = await db.collection("symptoms_keywords").get();
+  snap.forEach(doc => {
+    const d = doc.data();
+    (d.keywords_lowercase || []).forEach(k => { if (input.includes(k)) result.add(d.symptom); });
+  });
+  return [...result];
 }
 
-/* 🔥 DB FETCH */
-
-async function getAIlearning(type, symptoms, doctor_pathy) {
-  let result = [];
-
-  for (const sym of symptoms) {
-    const snap = await db.collection("ai_learning")
-      .where("doctor_pathy", "==", doctor_pathy)
-      .where("symptom", "==", normalize(sym))
-      .where("type", "==", type)
-      .orderBy("usage_count", "desc")
-      .limit(5)
-      .get();
-
-    snap.forEach(d => result.push(d.data().value));
-  }
-
-  return [...new Set(result)];
+/* 🔥 DB SEARCH & RANKING */
+async function getFromDB(symptoms, pathy) {
+  const map = new Map();
+  for (const sym of symptoms) {
+    const snap = await db.collection("medicine_master").where("pathy", "==", pathy).where("symptoms", "array-contains", sym).get();
+    snap.forEach(d => map.set(d.id, d.data()));
+  }
+  return [...map.values()].map(m => {
+    let score = (m.usage_count || 0) * 2;
+    if (m.verified) score += 5;
+    if (m.source === "doctor") score += 3;
+    return { ...m, score };
+  }).sort((a, b) => b.score - a.score);
 }
 
-async function getMaster(col, symptoms, doctor_pathy) {
-  let result = [];
-
-  for (const sym of symptoms) {
-    const snap = await db.collection(col)
-      .where("doctor_pathy", "==", doctor_pathy)
-      .where("symptom", "==", normalize(sym))
-      .get();
-
-    snap.forEach(d => result.push(d.data().value));
-  }
-
-  return [...new Set(result)];
-}
-
-async function saveToMaster(col, items, symptoms, doctor_pathy) {
-  const batch = db.batch();
-
-  items.forEach(item => {
-    symptoms.forEach(sym => {
-      const id = `${doctor_pathy}_${normalize(sym)}_${normalize(item)}`;
-
-      batch.set(db.collection(col).doc(id), {
-        doctor_pathy,
-        symptom: normalize(sym),
-        value: normalize(item),
-        source: "ai_generated",
-        created_at: new Date()
-      }, { merge: true });
-    });
-  });
-
-  await batch.commit();
-}
-
-/* 🔥 ANALYZE */
+/* 🔥 ANALYZE TEXT (With Caching) */
 app.post("/analyze", async (req, res) => {
-  try {
-    const { text, doctor_pathy = "Allopathy" } = req.body;
+  try {
+    const { text, doctor_pathy = "allopathy" } = req.body;
+    const cacheKey = `${doctor_pathy}_${text.slice(0, 20)}`;
+    if (localCache.has(cacheKey)) return res.json(localCache.get(cacheKey));
 
-    if (!text) return res.status(400).json({ error: "No input" });
+    let symptoms = await mapSymptoms(text);
+    let dbMeds = await getFromDB(symptoms, doctor_pathy);
+    
+    let finalData;
+    if (dbMeds.length >= 3) {
+      finalData = { symptoms, medicines: dbMeds, diagnosis: "Based on clinic records", diet: [], exercise: [], precautions: [] };
+    } else {
+      const ai = await callGemini(text, doctor_pathy);
+      finalData = { ...ai, prescription_id: db.collection("prescriptions").doc().id };
+    }
 
-    const ai = await callGemini(text, doctor_pathy);
-    const symptoms = ai.symptoms || [];
-
-    const process = async (type, masterCol, aiData) => {
-      const dbData = await getAIlearning(type, symptoms, doctor_pathy);
-      const master = await getMaster(masterCol, symptoms, doctor_pathy);
-
-      let result = rankResults(aiData || [], [...dbData, ...master]);
-
-      if (!result.length) {
-        result = aiData || [];
-        await saveToMaster(masterCol, result, symptoms, doctor_pathy);
-      }
-
-      return result;
-    };
-
-    const medicines = await process("medicine", "medicine_master", ai.medicines);
-    const diet = await process("diet", "diet_master", ai.diet);
-    const exercise = await process("exercise", "exercise_master", ai.exercise);
-    const precautions = await process("precautions", "precautions_master", ai.precautions);
-
-    res.json({ symptoms, medicines, diet, exercise, precautions });
-
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    localCache.set(cacheKey, finalData);
+    res.json(finalData);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* 🔥 SAVE PRESCRIPTION */
+/* 🔥 SAVE PRESCRIPTION (Strong DB Logic) */
 app.post("/save-prescription", async (req, res) => {
-  try {
-    const { doctor_pathy, symptoms, medicines, diet, exercise, precautions } = req.body;
+  try {
+    const { prescription_id, doctor_id, patient_id, doctor_pathy, medicines, symptoms, source } = req.body;
+    
+    const pRef = db.collection("prescriptions").doc(prescription_id);
+    await pRef.set({ doctor_id, patient_id, doctor_pathy, medicines, symptoms, source, created_at: new Date() });
 
-    const batch = db.batch();
+    const batch = db.batch();
+    medicines.forEach(m => {
+      const name = normalize(m.name);
+      batch.set(db.collection("doctor_uses").doc(), { doctor_id, medicine: name, symptoms, pathy: doctor_pathy, type: source, created_at: new Date() });
+      if (source === "direct" || source === "edited") {
+        batch.set(db.collection("medicine_master").doc(name), { name, pathy: doctor_pathy, symptoms, usage_count: admin.firestore.FieldValue.increment(2), verified: true, source: "doctor", updated_at: new Date() }, { merge: true });
+      }
+    });
+    await batch.commit();
 
-    const save = (type, items) => {
-      if (!items) return;
-
-      items.forEach(item => {
-        symptoms.forEach(sym => {
-          const id = `${type}_${doctor_pathy}_${normalize(sym)}_${normalize(item)}`;
-
-          batch.set(db.collection("ai_learning").doc(id), {
-            type,
-            doctor_pathy,
-            symptom: normalize(sym),
-            value: normalize(item),
-            usage_count: admin.firestore.FieldValue.increment(1),
-            updated_at: new Date(),
-            source: "doctor_used"
-          }, { merge: true });
-        });
-      });
-    };
-
-    save("medicine", medicines);
-    save("diet", diet);
-    save("exercise", exercise);
-    save("precautions", precautions);
-
-    await batch.commit();
-
-    res.json({ success: true });
-
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    // 🔥 UPGRADE 3: PDF Ready Signal
+    res.json({ success: true, pdf_url: `https://zeqvex.com/print/${prescription_id}` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* 🔥 ANALYTICS */
-app.get("/analytics/top", async (req, res) => {
-  const snap = await db.collection("ai_learning")
-    .orderBy("usage_count", "desc")
-    .limit(20)
-    .get();
-
-  res.json(snap.docs.map(d => d.data()));
+/* 🔐 SECURITY (OTP & History) */
+app.post("/request-access", async (req, res) => {
+  const { patient_id, doctor_id } = req.body;
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  await db.collection("otp_sessions").add({ otp, patient_id, doctor_id, used: false, created_at: Date.now() });
+  res.json({ success: true });
 });
 
-app.get("/analytics/symptoms", async (req, res) => {
-  const snap = await db.collection("ai_learning").get();
-
-  const map = {};
-  snap.forEach(doc => {
-    const s = doc.data().symptom;
-    map[s] = (map[s] || 0) + 1;
-  });
-
-  res.json(Object.entries(map).sort((a, b) => b[1] - a[1]).slice(0, 20));
+app.post("/verify-otp", async (req, res) => {
+  const { patient_id, doctor_id, otp } = req.body;
+  const snap = await db.collection("otp_sessions").where("patient_id", "==", patient_id).where("doctor_id", "==", doctor_id).where("otp", "==", otp).where("used", "==", false).limit(1).get();
+  if (snap.empty) return res.status(400).json({ error: "Invalid" });
+  const doc = snap.docs[0];
+  if (Date.now() - doc.data().created_at > OTP_EXPIRY_MS) return res.status(400).json({ error: "Expired" });
+  await doc.ref.update({ used: true });
+  await db.collection("access_logs").add({ patient_id, doctor_id, accessed_at: new Date() });
+  res.json({ success: true });
 });
 
-/* 🔥 ADMIN */
-app.delete("/admin/delete", async (req, res) => {
-  const { id } = req.body;
-  await db.collection("ai_learning").doc(id).delete();
-  res.json({ success: true });
+app.post("/patient-history", async (req, res) => {
+  const { patient_id, doctor_id } = req.body;
+  const otpSnap = await db.collection("otp_sessions").where("patient_id", "==", patient_id).where("doctor_id", "==", doctor_id).where("used", "==", true).limit(1).get();
+  if (otpSnap.empty) return res.status(403).json({ error: "Unauthorized" });
+  const snap = await db.collection("prescriptions").where("patient_id", "==", patient_id).orderBy("created_at", "desc").get();
+  const data = []; snap.forEach(doc => data.push(doc.data()));
+  res.json(data);
 });
 
-app.post("/admin/boost", async (req, res) => {
-  const { id, boost = 5 } = req.body;
-
-  await db.collection("ai_learning").doc(id).update({
-    usage_count: admin.firestore.FieldValue.increment(boost)
-  });
-
-  res.json({ success: true });
-});
-
-app.listen(10000, () => console.log("🔥 FINAL AI PLATFORM RUNNING"));
+app.listen(10000, () => console.log("🚀 ZEQVEX v1.5 POWERED UP"));
+ Me db.collection("access_logs").add(...)
