@@ -7,7 +7,7 @@ import fs from "fs";
 
 dotenv.config();
 const app = express();
-app.use(cors(), express.json({ limit: "50mb" }));
+app.use(cors(), express.json({ limit: '50mb' })); 
 
 /* 🔥 FIREBASE INIT */
 const serviceAccount = process.env.FIREBASE_KEY
@@ -22,151 +22,196 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-2.5-flash";
+const MODEL = "gemini-2.5-flash"; 
 
 const normalize = (t) => t?.toLowerCase().trim();
 const localCache = new Map();
 
-/* 🔥 SAFE JSON */
+/* 🔥 SUPER SAFE JSON PARSER (Fixed Format Error) */
 function safeJSON(txt) {
   try {
-    if (!txt) throw new Error("Empty");
-
+    // Markdown code blocks hatane ke liye
     let clean = txt.replace(/```json/g, "").replace(/```/g, "").trim();
-
-    const start = clean.indexOf("{");
-    const end = clean.lastIndexOf("}");
-
+    
+    // Sirf '{' se '}' tak ka hissa uthane ke liye (Extra text ignore karne ke liye)
+    const start = clean.indexOf('{');
+    const end = clean.lastIndexOf('}');
+    
     if (start !== -1 && end !== -1) {
-      return JSON.parse(clean.substring(start, end + 1));
+      clean = clean.substring(start, end + 1);
+      return JSON.parse(clean);
     }
-
-    throw new Error("No JSON");
-  } catch {
-    return {
-      symptoms: ["Analysis Failed"],
-      diagnosis: "Server Busy - Try Again",
-      medicines: [],
-      diet: [],
-      exercise: [],
-      precautions: []
+    throw new Error("No JSON found");
+  } catch (e) {
+    console.error("JSON Parsing failed. Text was:", txt);
+    return { 
+      symptoms: ["Analysis Error"], 
+      diagnosis: "Formatting Issue", 
+      medicines: [], 
+      diet: [], exercise: [], precautions: [] 
     };
   }
 }
 
-/* 🔥 PROMPT */
+/* 🔥 MASTER PROMPT (Barkaraar Logic: Language + EH Specialist) */
 const MASTER_PROMPT = `
-Act as a world-class diagnostic expert.
+Act as a world-class diagnostic expert. 
+1. Support all languages (Hindi, Marathi, Bengali, Gujarati, etc.). Output MUST be in English.
+2. If doctor_pathy is "electrohomeopathy", "electro_homeopathy", "eh", "electropathy", or "electro_pathy": 
+   STRICTLY use Electro-Homeopathy remedies like S1, F1, A2, C5, L1, BE, WE, RE, etc.
+3. If doctor_pathy is "allopathy" or others: Use relevant standard medicines.
+4. Return ONLY a valid raw JSON object. Do not include any introductory or concluding text.
 
-Understand any Indian language.
-Output MUST be English.
-Return STRICT JSON only.
-
+Format:
 {
-  "symptoms": [],
-  "diagnosis": "",
-  "medicines": [],
-  "diet": [],
-  "exercise": [],
-  "precautions": []
-}
-`;
+  "symptoms": ["Professional Term 1", "Professional Term 2"],
+  "diagnosis": "Clinical Diagnosis Name",
+  "medicines": [{"name": "Medicine Name", "type": "primary", "pathy": "Pathy Name", "dosage": "Exact Dose", "duration": "Days"}],
+  "diet": ["Advice 1"],
+  "exercise": ["Advice 1"],
+  "precautions": ["Advice 1"]
+}`;
 
-/* 🔥 ULTRA FIXED GEMINI */
+/* 🔥 GEMINI CALLER */
 async function callGemini(text, pathy) {
-  const prompt = `Pathy: ${pathy}\nPatient: ${text}\n${MASTER_PROMPT}`;
-
-  for (let i = 1; i <= 3; i++) {
-    try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: prompt }] }]
-          })
-        }
-      );
-
-      const data = await res.json();
-
-      // 🔥 HANDLE 503
-      if (data?.error?.code === 503) {
-        console.warn(`⏳ Retry ${i} - Gemini busy`);
-        await new Promise(r => setTimeout(r, 1000 * i));
-        continue;
-      }
-
-      let txt = "";
-      if (data?.candidates?.length) {
-        for (const p of data.candidates[0].content.parts || []) {
-          if (p.text) txt += p.text;
-        }
-      }
-
-      if (!txt) {
-        console.error("❌ EMPTY RESPONSE:", data);
-        continue;
-      }
-
-      return safeJSON(txt);
-
-    } catch (e) {
-      console.error(`❌ Retry ${i} failed`);
-      await new Promise(r => setTimeout(r, 1000));
-    }
+  const prompt = `Requested Pathy: ${pathy}\nPatient Input: ${text}\n\n${MASTER_PROMPT}`;
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ 
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { response_mime_type: "application/json" } // Force JSON mode
+      }),
+    });
+    const data = await res.json();
+    const txt = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    return safeJSON(txt);
+  } catch (e) { 
+    console.error("Gemini API Call Error:", e);
+    return safeJSON(""); 
   }
-
-  // 🔥 FINAL SAFE RETURN
-  return {
-    symptoms: ["Server Busy"],
-    diagnosis: "High traffic on AI server",
-    medicines: [],
-    diet: [],
-    exercise: [],
-    precautions: []
-  };
 }
 
-/* 🔥 बाकी code SAME है (touch नहीं किया) */
+/* 🔥 1. SYMPTOMS MAPPING */
+async function mapSymptoms(input) {
+  input = input.toLowerCase();
+  const result = new Set();
+  const snap = await db.collection("symptoms_keywords").get();
+  snap.forEach(doc => {
+    const d = doc.data();
+    (d.keywords_lowercase || []).forEach(k => { if (input.includes(k)) result.add(d.symptom); });
+  });
+  return [...result];
+}
 
+/* 🔥 2. DATABASE SEARCH */
+async function getFromDB(symptoms, pathy) {
+  const map = new Map();
+  if (symptoms.length === 0) return [];
+  for (const sym of symptoms) {
+    const snap = await db.collection("medicine_master")
+      .where("pathy", "==", pathy)
+      .where("symptoms", "array-contains", sym)
+      .get();
+    snap.forEach(d => map.set(d.id, d.data()));
+  }
+  return [...map.values()];
+}
+
+/* 🔥 3. ANALYZE (Puchne Ke Liye) */
 app.post("/analyze", async (req, res) => {
   try {
     const { text, doctor_pathy = "allopathy" } = req.body;
-
     const cacheKey = `${doctor_pathy}_${text.slice(0, 30)}`;
-    if (localCache.has(cacheKey))
-      return res.json(localCache.get(cacheKey));
+    if (localCache.has(cacheKey)) return res.json(localCache.get(cacheKey));
 
     let symptoms = await mapSymptoms(text);
     let dbMeds = await getFromDB(symptoms, doctor_pathy);
-
+    
     let finalData;
 
     if (dbMeds.length >= 3) {
       finalData = {
-        symptoms,
-        diagnosis: "Verified via records",
+        symptoms: symptoms,
+        diagnosis: "Verified via clinical records",
         medicines: dbMeds,
-        diet: ["Follow protocol"],
+        diet: ["Follow pathy protocol"],
         exercise: ["As advised"],
-        precautions: ["Standard precautions"],
-        source: "local_db",
+        precautions: ["Standard safety tips"],
+        source: "local_db"
       };
     } else {
       const ai = await callGemini(text, doctor_pathy);
       finalData = { ...ai, source: "gemini" };
     }
 
-    finalData.prescription_id =
-      db.collection("prescriptions").doc().id;
-
+    finalData.prescription_id = db.collection("prescriptions").doc().id;
     localCache.set(cacheKey, finalData);
-
     res.json(finalData);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+/* 🔥 4. SAVE PRESCRIPTION (Likne Ke Liye) */
+app.post("/save-prescription", async (req, res) => {
+  try {
+    const { prescription_id, doctor_id, patient_id, doctor_pathy, medicines, symptoms, source } = req.body;
+
+    if (!prescription_id) return res.status(400).json({ error: "prescription_id missing" });
+
+    await db.collection("prescriptions").doc(prescription_id).set({
+      doctor_id, patient_id, doctor_pathy, medicines, symptoms, source,
+      created_at: new Date()
+    });
+
+    const batch = db.batch();
+    medicines.forEach(m => {
+      const name = normalize(m.name);
+      
+      batch.set(db.collection("doctor_uses").doc(), {
+        doctor_id, medicine_name: name, symptoms, doctor_pathy, type: source, created_at: new Date()
+      });
+
+      if (source === "direct" || source === "edited") {
+        batch.set(db.collection("medicine_master").doc(name), {
+          name, pathy: doctor_pathy, symptoms: symptoms,
+          usage_count: admin.firestore.FieldValue.increment(5),
+          verified: true, updated_at: new Date()
+        }, { merge: true });
+      }
+    });
+
+    await batch.commit();
+    res.json({ success: true, message: "Data successfully saved in Console!" });
+
+  } catch (e) { 
+    console.error("Save Error:", e.message);
+    res.status(500).json({ success: false, error: e.message }); 
   }
 });
+
+/* 🔐 5. ACCESS & HISTORY */
+app.post("/request-access", async (req, res) => {
+  const { patient_id, doctor_id } = req.body;
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  await db.collection("otp_sessions").add({ otp, patient_id, doctor_id, used: false, created_at: Date.now() });
+  res.json({ success: true, otp }); 
+});
+
+app.post("/verify-otp", async (req, res) => {
+  const { otp } = req.body;
+  const snap = await db.collection("otp_sessions").where("otp", "==", otp).where("used", "==", false).limit(1).get();
+  if (snap.empty) return res.status(400).json({ error: "Invalid OTP" });
+  await snap.docs[0].ref.update({ used: true });
+  res.json({ success: true });
+});
+
+app.post("/patient-history", async (req, res) => {
+  const { patient_id } = req.body;
+  const snap = await db.collection("prescriptions").where("patient_id", "==", patient_id).orderBy("created_at", "desc").get();
+  const data = []; snap.forEach(doc => data.push(doc.data()));
+  res.json(data);
+});
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`🚀 ZEQVEX v1.7.0 LIVE ON PORT ${PORT}`));
