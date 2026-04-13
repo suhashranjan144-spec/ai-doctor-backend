@@ -22,7 +22,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-1.5-flash";
+const MODEL = "gemini-2.5-flash";
 
 const normalize = (t) => t?.toLowerCase().trim();
 const localCache = new Map();
