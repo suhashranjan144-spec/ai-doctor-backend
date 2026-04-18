@@ -40,30 +40,53 @@ async function callGemini(text) {
           parts: [
             {
               text: `
-STRICT JSON ONLY
+You are a highly experienced clinical doctor with multi-pathy knowledge:
+- Allopathy
+- Homeopathy
+- Ayurveda
+- Electro-homeopathy
 
-Extract:
-- symptoms
-- medicines
-- diet
-- exercise
-- precautions
+Your job:
+1. Understand patient input in ANY language (Hindi, English, Hinglish, etc.)
+2. Convert it into professional clinical understanding
+3. Generate a SAFE and PRACTICAL prescription
 
-INPUT: ${text}
+IMPORTANT RULES:
+- Output STRICT JSON ONLY (no text outside JSON)
+- Always respond in ENGLISH (professional medical format)
+- Do NOT leave fields empty
+- Keep medicines realistic and safe
+- Diet and exercise MUST be condition-specific
+- Avoid dangerous or restricted drugs
 
-OUTPUT:
+INPUT (patient complaint in any language):
+"${text}"
+
+OUTPUT FORMAT:
 {
- "symptoms": [],
- "medicines": [],
- "diet": [],
- "exercise": [],
- "precautions": []
+  "language_detected": "",
+  "symptoms": [],
+  "diagnosis": "",
+  "medicines": [
+    {
+      "name": "",
+      "type": "allopathy/homeopathy/ayurveda/electrohomeopathy",
+      "dosage": "",
+      "duration": ""
+    }
+  ],
+  "diet": [],
+  "exercise": [],
+  "precautions": []
 }
               `,
             },
           ],
         },
       ],
+      generationConfig: {
+        temperature: 0.3,
+      },
     }),
   });
 
@@ -76,7 +99,8 @@ OUTPUT:
 
   try {
     return JSON.parse(txt);
-  } catch {
+  } catch (err) {
+    console.log("❌ JSON Parse Error:", txt);
     return {};
   }
 }
