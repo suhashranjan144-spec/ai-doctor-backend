@@ -29,7 +29,7 @@ const normalize = (t) => t?.toLowerCase().trim();
 /* 🔥 REFINED JSON PARSER */
 function safeJSON(txt) {
   try {
-    if (!txt) throw new Error("No response from AI");
+    if (!txt) throw new Error("No response");
     let clean = txt.replace(/```json/g, "").replace(/```/g, "").trim();
     const start = clean.indexOf('{');
     const end = clean.lastIndexOf('}');
@@ -40,34 +40,23 @@ function safeJSON(txt) {
     throw new Error("Invalid format");
   } catch (e) {
     console.log("⚠️ AI raw response error:", txt);
-    return { 
-      symptoms: ["Identify Manually"], 
-      diagnosis: "AI Response Format Error", 
-      medicines: [], diet: [], exercise: [], precautions: [] 
-    };
+    return null;
   }
 }
 
-const MASTER_PROMPT = `You are a Senior Consultant Medical Doctor.
-TASKS: Translate complaints to Clinical English, Provide Diagnosis, and Prescribe Medicines.
-PATHY: If 'electrohomeopathy', use EH remedies. If 'allopathy', use standard drugs.
-FORMAT: JSON ONLY.`;
-
-/* 🔥 GEMINI CALLER */
+/* 🔥 GEMINI CALLER (Fallback Engine) */
 async function callGemini(text, pathy) {
-  const cleanPathy = pathy.toLowerCase().includes("electro") ? "electrohomeopathy" : pathy;
-  const prompt = `Requested Pathy: ${cleanPathy}\nPatient Data: ${text}\n\n${MASTER_PROMPT}`;
+  const MASTER_PROMPT = `You are a Senior Consultant Doctor. 
+  Output valid JSON ONLY with keys: symptoms, diagnosis, medicines (array with name, dosage, duration), diet, exercise, precautions. 
+  Pathy Rule: If 'electrohomeopathy', use EH remedies. If 'allopathy', use standard drugs.`;
   
   try {
     const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ 
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ parts: [{ text: `Patient Complaints: ${text}\nRequested Pathy: ${pathy}\n\n${MASTER_PROMPT}` }] }],
         safetySettings: [
-          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
           { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
         ]
       }),
@@ -75,141 +64,120 @@ async function callGemini(text, pathy) {
     const data = await res.json();
     const txt = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
     return safeJSON(txt);
-  } catch (e) { return safeJSON(""); }
+  } catch (e) { return null; }
 }
 
-/* 🔥 ANALYZE ENDPOINT (Database First, Gemini Second) */
-app.post("/analyze", async (req, res) => {
+/* 🔥 THE SUPER ENDPOINT: PROCESS, FETCH & AUTO-SAVE */
+app.post("/direct-save", async (req, res) => {
   try {
-    const { text, doctor_pathy = "allopathy" } = req.body;
-    if (!text) return res.status(400).json({ error: "Input text is required" });
+    const { text, doctor_id, patient_id, doctor_pathy = "allopathy", source = "direct" } = req.body;
+    if (!text) return res.status(400).json({ error: "Voice/Text input is required" });
 
-    // Step 1: Check Symptoms Keywords in DB
-    let symptomsList = [];
-    const snap = await db.collection("symptoms_keywords").get();
-    snap.forEach(doc => {
+    const ts = new Date();
+    const batch = db.batch();
+    const prescription_id = db.collection("prescriptions").doc().id;
+
+    // --- STEP 1: DB SEARCH (Symptom Matching) ---
+    let finalMedicines = [];
+    let finalSymptoms = [];
+    let dataSource = source;
+    let diagnosis = "Diagnosis Pending";
+
+    let matchedSymptoms = [];
+    const symSnap = await db.collection("symptoms_keywords").get();
+    symSnap.forEach(doc => {
       const d = doc.data();
       (d.keywords_lowercase || []).forEach(k => { 
-        if (text.toLowerCase().includes(k)) symptomsList.push(d.symptom); 
+        if (text.toLowerCase().includes(k)) matchedSymptoms.push(d.symptom); 
       });
     });
 
-    // Step 2: Check Medicine Master for matched symptoms
-    let dbMeds = [];
-    if (symptomsList.length > 0) {
-      for (const sym of [...new Set(symptomsList)]) {
+    if (matchedSymptoms.length > 0) {
+      const uniqueSymptoms = [...new Set(matchedSymptoms)];
+      for (const sym of uniqueSymptoms) {
         const mSnap = await db.collection("medicine_master")
           .where("pathy", "==", doctor_pathy)
-          .where("symptoms", "array-contains", sym)
-          .get();
-        mSnap.forEach(d => dbMeds.push(d.data()));
+          .where("symptoms", "array-contains", sym).get();
+        mSnap.forEach(d => finalMedicines.push(d.data()));
+      }
+      finalSymptoms = uniqueSymptoms;
+      diagnosis = "Verified from clinic database";
+      dataSource = "local_db";
+    }
+
+    // --- STEP 2: GEMINI FALLBACK (Agar DB mein medicine nahi mili) ---
+    if (finalMedicines.length < 1) {
+      const aiResponse = await callGemini(text, doctor_pathy);
+      if (aiResponse) {
+        // Handle Gemini key variations (remedy vs name)
+        finalMedicines = (aiResponse.medicines || aiResponse.medicines_prescribed || []).map(m => ({
+          name: m.name || m.remedy,
+          dosage: m.dosage,
+          duration: m.duration,
+          pathy: doctor_pathy
+        }));
+        finalSymptoms = aiResponse.symptoms || [];
+        diagnosis = aiResponse.diagnosis || "AI Generated Diagnosis";
+        dataSource = "gemini";
       }
     }
 
-    let finalData;
-    // Logic: Agar DB mein kam se kam 3 medicines mil jayein toh Gemini ko skip karo
-    if (dbMeds.length >= 3) {
-      finalData = { 
-        symptoms: [...new Set(symptomsList)], 
-        diagnosis: "Verified from clinic database", 
-        medicines: dbMeds, 
-        source: "local_db" 
-      };
-    } else {
-      // Fallback: Gemini ko call karo agar DB weak hai
-      const ai = await callGemini(text, doctor_pathy);
-      finalData = { ...ai, source: "gemini" };
-    }
-
-    finalData.prescription_id = db.collection("prescriptions").doc().id;
-    res.json(finalData);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-/* 🔥 SMART SAVE ENDPOINT - VYONALIFE CONCEPT */
-app.post("/save-prescription", async (req, res) => {
-  try {
-    const { 
-      prescription_id, 
-      doctor_id, 
-      patient_id, 
-      doctor_pathy, 
-      medicines, 
-      symptoms, 
-      source // "gemini", "edited", ya "direct"
-    } = req.body;
-
-    const batch = db.batch();
-    const ts = new Date();
-
-    // 1. Hamesha: Main Prescription save karo
+    // --- STEP 3: AUTO-SYNC TO ALL 4 COLLECTIONS ---
+    // 1. prescriptions
     batch.set(db.collection("prescriptions").doc(prescription_id), {
-      doctor_id, patient_id, doctor_pathy, medicines, symptoms, source, created_at: ts
+      doctor_id, patient_id, doctor_pathy, diagnosis,
+      medicines: finalMedicines, symptoms: finalSymptoms, 
+      source: dataSource, created_at: ts
     });
 
-    (medicines || []).forEach(m => {
+    finalMedicines.forEach(m => {
       const medName = normalize(m.name);
       const medId = `${doctor_pathy}_${medName.replace(/\s+/g, '_')}`;
 
-      // 2. Hamesha: Doctor Uses Collection (Tracking ke liye)
+      // 2. doctor_uses (Hamesha tracking ke liye)
       batch.set(db.collection("doctor_uses").doc(), { 
-        doctor_id, medicine_name: medName, symptoms, doctor_pathy, type: source, created_at: ts 
+        doctor_id, medicine_name: medName, symptoms: finalSymptoms, doctor_pathy, type: dataSource, created_at: ts 
       });
 
-      // --- SMART LOGIC STARTS HERE ---
-
-      // A. Agar doctor ne Gemini ka data edit kiya toh AI_LEARNING mein dalo
-      if (source === "edited") {
+      // 3. ai_learning (Sirf agar Gemini use hua ya Dr ne edit kiya - for retraining)
+      if (dataSource === "gemini" || source === "edited") {
         batch.set(db.collection("ai_learning").doc(), {
-          input_symptoms: symptoms,
-          doctor_medicine: medName,
-          pathy: doctor_pathy,
-          doctor_id: doctor_id,
-          timestamp: ts
-        });
-      } 
-
-      // B. Gemini ka data (Fallback) ya Doctor ka Direct data hamesha DB ko bharega
-      // Isse aapka Medicine Master aur Keywords strong honge
-      if (source === "gemini" || source === "direct" || source === "edited") {
-        
-        // Update Medicine Master
-        const masterRef = db.collection("medicine_master").doc(medId);
-        batch.set(masterRef, {
-          name: m.name,
-          pathy: doctor_pathy,
-          symptoms: admin.firestore.FieldValue.arrayUnion(...symptoms),
-          usage_count: admin.firestore.FieldValue.increment(1),
-          verified: source !== "gemini", // Dr ka data verified, Gemini raw
-          updated_at: ts
-        }, { merge: true });
-
-        // Update Symptoms Keywords (Sabse important Gemini fallback ke liye)
-        symptoms.forEach(sym => {
-          const symKey = normalize(sym).replace(/\s+/g, '_');
-          batch.set(db.collection("symptoms_keywords").doc(symKey), {
-            symptom: sym,
-            keywords_lowercase: admin.firestore.FieldValue.arrayUnion(normalize(sym))
-          }, { merge: true });
+          input_text: text, input_symptoms: finalSymptoms, doctor_medicine: medName, pathy: doctor_pathy, timestamp: ts
         });
       }
+
+      // 4. medicine_master & symptoms_keywords (DB Strengthening)
+      const masterRef = db.collection("medicine_master").doc(medId);
+      batch.set(masterRef, {
+        name: m.name, pathy: doctor_pathy, symptoms: admin.firestore.FieldValue.arrayUnion(...finalSymptoms),
+        usage_count: admin.firestore.FieldValue.increment(1), 
+        verified: dataSource !== "gemini", 
+        updated_at: ts
+      }, { merge: true });
+
+      finalSymptoms.forEach(sym => {
+        const symKey = normalize(sym).replace(/\s+/g, '_');
+        batch.set(db.collection("symptoms_keywords").doc(symKey), {
+          symptom: sym, 
+          keywords_lowercase: admin.firestore.FieldValue.arrayUnion(normalize(sym))
+        }, { merge: true });
+      });
     });
 
     await batch.commit();
-    res.json({ success: true, message: "ZEQVEX DB Stronger Now!" });
-  } catch (e) { 
-    res.status(500).json({ error: e.message }); 
-  }
-});
 
-/* 🔐 OTHER ENDPOINTS */
-app.post("/request-access", async (req, res) => {
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  await db.collection("otp_sessions").add({ 
-    otp, patient_id: req.body.patient_id, doctor_id: req.body.doctor_id, used: false, created_at: Date.now() 
-  });
-  res.json({ success: true, otp }); 
+    // Final response to App
+    res.json({ 
+      success: true, 
+      prescription_id, 
+      source: dataSource, 
+      diagnosis,
+      medicines: finalMedicines,
+      symptoms: finalSymptoms 
+    });
+
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 ZEQVEX v2.0 READY (Gemini 2.5 Flash)`));
+app.listen(PORT, () => console.log(`🚀 VYONALIFE v2.5: DIRECT-SAVE READY`));
