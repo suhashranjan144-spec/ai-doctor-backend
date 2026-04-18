@@ -18,6 +18,7 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
+const FieldValue = admin.firestore.FieldValue;
 
 /* 🔑 GEMINI */
 const API_KEY = process.env.GEMINI_API_KEY;
@@ -26,72 +27,11 @@ const MODEL = "gemini-2.5-flash";
 /* 🧠 NORMALIZE */
 const normalize = (t) => t?.toLowerCase().trim();
 
-/* 🧠 SCHEMA VALIDATOR */
-function validateSchema(data) {
-  return {
-    symptoms: Array.isArray(data.symptoms) ? data.symptoms : [],
-    medicines: Array.isArray(data.medicines) ? data.medicines : [],
-    diet: Array.isArray(data.diet) ? data.diet : [],
-    exercise: Array.isArray(data.exercise) ? data.exercise : [],
-    precautions: Array.isArray(data.precautions) ? data.precautions : [],
-  };
-}
-
-/* 🔍 DB SEARCH */
-async function searchDoctorUsage(symptoms) {
-  let meds = [];
-
-  for (const sym of symptoms) {
-    const snap = await db
-      .collection("doctor_uses")
-      .where("symptom", "==", normalize(sym))
-      .orderBy("usage_count", "desc")
-      .limit(3)
-      .get();
-
-    snap.forEach((doc) => {
-      meds.push(doc.data().medicine_name);
-    });
-  }
-
-  return [...new Set(meds)];
-}
-
-/* 💾 LEARNING */
-async function updateDoctorUsage(doctor_id, symptoms, medicines) {
-  for (const sym of symptoms) {
-    for (const med of medicines) {
-      const snap = await db
-        .collection("doctor_uses")
-        .where("doctor_id", "==", doctor_id)
-        .where("symptom", "==", normalize(sym))
-        .where("medicine_name", "==", normalize(med))
-        .get();
-
-      if (!snap.empty) {
-        await snap.docs[0].ref.update({
-          usage_count: admin.firestore.FieldValue.increment(1),
-          last_used: new Date(),
-        });
-      } else {
-        await db.collection("doctor_uses").add({
-          doctor_id,
-          symptom: normalize(sym),
-          medicine_name: normalize(med),
-          usage_count: 1,
-          created_at: new Date(),
-          last_used: new Date(),
-        });
-      }
-    }
-  }
-}
-
-/* 🤖 GEMINI CALL (STRONG PROMPT) */
+/* 🤖 GEMINI CALL */
 async function callGemini(text) {
-  const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
 
-  const response = await fetch(API_URL, {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -100,81 +40,153 @@ async function callGemini(text) {
           parts: [
             {
               text: `
-You are a highly intelligent clinical assistant.
+STRICT JSON ONLY
 
-Analyze patient symptoms and generate practical treatment advice.
+Extract:
+- symptoms
+- medicines
+- diet
+- exercise
+- precautions
 
-RULES:
-- Output STRICT JSON only
-- Do NOT leave fields empty
-- Make diet/exercise condition-specific (NOT generic)
-- Medicines should be realistic
-
-INPUT:
-${text}
+INPUT: ${text}
 
 OUTPUT:
 {
-  "symptoms": [],
-  "medicines": [],
-  "diet": [],
-  "exercise": [],
-  "precautions": []
+ "symptoms": [],
+ "medicines": [],
+ "diet": [],
+ "exercise": [],
+ "precautions": []
 }
               `,
             },
           ],
         },
       ],
-      generationConfig: { temperature: 0.4 },
     }),
   });
 
-  const data = await response.json();
+  const data = await res.json();
 
-  let aiText =
+  let txt =
     data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-  aiText = aiText.replace(/```json|```/g, "").trim();
+  txt = txt.replace(/```json|```/g, "").trim();
 
   try {
-    return JSON.parse(aiText);
+    return JSON.parse(txt);
   } catch {
     return {};
   }
 }
 
-/* 🚀 ANALYZE */
+/* 🔍 DB SEARCH */
+async function searchFromDB(symptoms) {
+  let meds = [];
+
+  for (const sym of symptoms) {
+    const snap = await db
+      .collection("symptoms_keywords")
+      .where("symptom", "==", normalize(sym))
+      .limit(3)
+      .get();
+
+    snap.forEach((doc) => {
+      meds.push(doc.data().medicine);
+    });
+  }
+
+  return [...new Set(meds)];
+}
+
+/* 💀 LEARNING ENGINE */
+async function learnEverything(
+  doctor_id,
+  symptoms,
+  medicines,
+  aiData,
+  finalData
+) {
+  const now = new Date();
+
+  // 1. prescriptions
+  await db.collection("prescriptions").add({
+    doctor_id,
+    symptoms,
+    medicines,
+    created_at: now,
+  });
+
+  // 2. medicine_master
+  for (const med of medicines) {
+    await db.collection("medicine_master").add({
+      name: normalize(med),
+      created_at: now,
+    });
+  }
+
+  // 3. symptoms_keywords
+  for (const sym of symptoms) {
+    for (const med of medicines) {
+      await db.collection("symptoms_keywords").add({
+        symptom: normalize(sym),
+        medicine: normalize(med),
+      });
+    }
+  }
+
+  // 4. doctor_uses
+  for (const sym of symptoms) {
+    for (const med of medicines) {
+      await db.collection("doctor_uses").add({
+        doctor_id,
+        symptom: normalize(sym),
+        medicine: normalize(med),
+        usage_count: FieldValue.increment(1),
+        last_used: now,
+      });
+    }
+  }
+
+  // 5. ai_learning
+  if (JSON.stringify(aiData) !== JSON.stringify(finalData)) {
+    await db.collection("ai_learning").add({
+      aiData,
+      correctedData: finalData,
+      created_at: now,
+    });
+  }
+}
+
+/* 🚀 ANALYZE API */
 app.post("/analyze", async (req, res) => {
   try {
-    const { text, doctor_id = "default_doc" } = req.body;
+    const { text } = req.body;
 
     if (!text) {
       return res.status(400).json({ error: "Text required" });
     }
 
-    const aiRaw = await callGemini(text);
-    const ai = validateSchema(aiRaw);
+    // 1. AI se symptoms
+    const aiData = await callGemini(text);
+    const symptoms = aiData.symptoms || [];
 
-    const dbMeds = await searchDoctorUsage(ai.symptoms);
+    // 2. DB check
+    const dbMeds = await searchFromDB(symptoms);
 
-    let finalMedicines =
-      dbMeds.length > 0
-        ? dbMeds
-        : ai.medicines.length > 0
-        ? ai.medicines
-        : ["Consult doctor"];
+    if (dbMeds.length > 0) {
+      return res.json({
+        source: "database",
+        symptoms,
+        medicines: dbMeds,
+      });
+    }
 
-    /* 🔥 ALWAYS LEARN */
-    await updateDoctorUsage(
-      doctor_id,
-      ai.symptoms,
-      finalMedicines
-    );
-
+    // 3. AI fallback
     return res.json({
-      ...ai,
-      medicines: finalMedicines,
+      source: "ai",
+      ...aiData,
     });
 
   } catch (e) {
@@ -182,12 +194,28 @@ app.post("/analyze", async (req, res) => {
   }
 });
 
-/* 💾 SAVE */
-app.post("/save-prescription", async (req, res) => {
+/* 💾 SAVE API */
+app.post("/save", async (req, res) => {
   try {
-    const { doctor_id, symptoms, medicines } = req.body;
+    const {
+      doctor_id = "default_doc",
+      symptoms,
+      medicines,
+      aiData = {},
+      finalData = {},
+    } = req.body;
 
-    await updateDoctorUsage(doctor_id, symptoms, medicines);
+    if (!symptoms || !medicines) {
+      return res.status(400).json({ error: "Missing data" });
+    }
+
+    await learnEverything(
+      doctor_id,
+      symptoms,
+      medicines,
+      aiData,
+      finalData
+    );
 
     res.json({ success: true });
 
@@ -196,6 +224,12 @@ app.post("/save-prescription", async (req, res) => {
   }
 });
 
-app.listen(process.env.PORT || 3000, () =>
-  console.log("🔥 Server running")
-);
+/* 🧪 TEST ROUTE */
+app.get("/", (req, res) => {
+  res.send("🔥 AI Doctor Backend Running");
+});
+
+/* 🚀 START */
+app.listen(process.env.PORT || 3000, () => {
+  console.log("🔥 Server running");
+});
