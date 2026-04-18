@@ -22,7 +22,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-2.5-flash"; // Wahi version jo aap use kar rahe the
+const MODEL = "gemini-2.5-flash"; 
 
 const normalize = (t) => t?.toLowerCase().trim();
 
@@ -78,12 +78,13 @@ async function callGemini(text, pathy) {
   } catch (e) { return safeJSON(""); }
 }
 
-/* 🔥 ANALYZE ENDPOINT */
+/* 🔥 ANALYZE ENDPOINT (Database First, Gemini Second) */
 app.post("/analyze", async (req, res) => {
   try {
     const { text, doctor_pathy = "allopathy" } = req.body;
     if (!text) return res.status(400).json({ error: "Input text is required" });
 
+    // Step 1: Check Symptoms Keywords in DB
     let symptomsList = [];
     const snap = await db.collection("symptoms_keywords").get();
     snap.forEach(doc => {
@@ -93,6 +94,7 @@ app.post("/analyze", async (req, res) => {
       });
     });
 
+    // Step 2: Check Medicine Master for matched symptoms
     let dbMeds = [];
     if (symptomsList.length > 0) {
       for (const sym of [...new Set(symptomsList)]) {
@@ -105,61 +107,109 @@ app.post("/analyze", async (req, res) => {
     }
 
     let finalData;
+    // Logic: Agar DB mein kam se kam 3 medicines mil jayein toh Gemini ko skip karo
     if (dbMeds.length >= 3) {
-      finalData = { symptoms: [...new Set(symptomsList)], diagnosis: "Verified from clinic database", medicines: dbMeds, source: "local_db" };
+      finalData = { 
+        symptoms: [...new Set(symptomsList)], 
+        diagnosis: "Verified from clinic database", 
+        medicines: dbMeds, 
+        source: "local_db" 
+      };
     } else {
+      // Fallback: Gemini ko call karo agar DB weak hai
       const ai = await callGemini(text, doctor_pathy);
       finalData = { ...ai, source: "gemini" };
     }
+
     finalData.prescription_id = db.collection("prescriptions").doc().id;
     res.json(finalData);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* 🔥 SMART SAVE ENDPOINT */
+/* 🔥 SMART SAVE ENDPOINT - VYONALIFE CONCEPT */
 app.post("/save-prescription", async (req, res) => {
   try {
-    const { prescription_id, doctor_id, patient_id, doctor_pathy, medicines, symptoms, source } = req.body;
+    const { 
+      prescription_id, 
+      doctor_id, 
+      patient_id, 
+      doctor_pathy, 
+      medicines, 
+      symptoms, 
+      source // "gemini", "edited", ya "direct"
+    } = req.body;
+
     const batch = db.batch();
     const ts = new Date();
 
-    // 1. Prescription Save
+    // 1. Hamesha: Main Prescription save karo
     batch.set(db.collection("prescriptions").doc(prescription_id), {
       doctor_id, patient_id, doctor_pathy, medicines, symptoms, source, created_at: ts
     });
 
     (medicines || []).forEach(m => {
       const medName = normalize(m.name);
-      
-      // 2. Doctor Uses Log
-      batch.set(db.collection("doctor_uses").doc(), { doctor_id, medicine_name: medName, symptoms, doctor_pathy, type: source, created_at: ts });
+      const medId = `${doctor_pathy}_${medName.replace(/\s+/g, '_')}`;
 
-      // 3. SMART SYNC (Learning + Medicine Master + Keywords)
-      if (source === "edited" || source === "direct") {
-        // AI Learning Log
-        batch.set(db.collection("ai_learning").doc(), { input_symptoms: symptoms, doctor_medicine: medName, pathy: doctor_pathy, timestamp: ts });
+      // 2. Hamesha: Doctor Uses Collection (Tracking ke liye)
+      batch.set(db.collection("doctor_uses").doc(), { 
+        doctor_id, medicine_name: medName, symptoms, doctor_pathy, type: source, created_at: ts 
+      });
 
-        // Medicine Master Update
-        const masterRef = db.collection("medicine_master").doc(`${doctor_pathy}_${medName.replace(/\s+/g, '_')}`);
+      // --- SMART LOGIC STARTS HERE ---
+
+      // A. Agar doctor ne Gemini ka data edit kiya toh AI_LEARNING mein dalo
+      if (source === "edited") {
+        batch.set(db.collection("ai_learning").doc(), {
+          input_symptoms: symptoms,
+          doctor_medicine: medName,
+          pathy: doctor_pathy,
+          doctor_id: doctor_id,
+          timestamp: ts
+        });
+      } 
+
+      // B. Gemini ka data (Fallback) ya Doctor ka Direct data hamesha DB ko bharega
+      // Isse aapka Medicine Master aur Keywords strong honge
+      if (source === "gemini" || source === "direct" || source === "edited") {
+        
+        // Update Medicine Master
+        const masterRef = db.collection("medicine_master").doc(medId);
         batch.set(masterRef, {
-          name: m.name, pathy: doctor_pathy, symptoms: admin.firestore.FieldValue.arrayUnion(...symptoms),
-          usage_count: admin.firestore.FieldValue.increment(1), verified: true, updated_at: ts
+          name: m.name,
+          pathy: doctor_pathy,
+          symptoms: admin.firestore.FieldValue.arrayUnion(...symptoms),
+          usage_count: admin.firestore.FieldValue.increment(1),
+          verified: source !== "gemini", // Dr ka data verified, Gemini raw
+          updated_at: ts
         }, { merge: true });
 
-        // Symptoms Keywords Update
+        // Update Symptoms Keywords (Sabse important Gemini fallback ke liye)
         symptoms.forEach(sym => {
           const symKey = normalize(sym).replace(/\s+/g, '_');
           batch.set(db.collection("symptoms_keywords").doc(symKey), {
-            symptom: sym, keywords_lowercase: admin.firestore.FieldValue.arrayUnion(normalize(sym))
+            symptom: sym,
+            keywords_lowercase: admin.firestore.FieldValue.arrayUnion(normalize(sym))
           }, { merge: true });
         });
       }
     });
 
     await batch.commit();
-    res.json({ success: true, message: "VyonaLife Synced Successfully!" });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({ success: true, message: "ZEQVEX DB Stronger Now!" });
+  } catch (e) { 
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
+/* 🔐 OTHER ENDPOINTS */
+app.post("/request-access", async (req, res) => {
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  await db.collection("otp_sessions").add({ 
+    otp, patient_id: req.body.patient_id, doctor_id: req.body.doctor_id, used: false, created_at: Date.now() 
+  });
+  res.json({ success: true, otp }); 
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 BACKEND READY (Gemini 2.5 Flash)`));
+app.listen(PORT, () => console.log(`🚀 ZEQVEX v2.0 READY (Gemini 2.5 Flash)`));
