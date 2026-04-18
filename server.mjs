@@ -40,29 +40,20 @@ async function callGemini(text) {
           parts: [
             {
               text: `
-You are a highly experienced clinical doctor with multi-pathy knowledge:
-- Allopathy
-- Homeopathy
-- Ayurveda
-- Electro-homeopathy
+You are a multi-pathy clinical assistant.
 
-Your job:
-1. Understand patient input in ANY language (Hindi, English, Hinglish, etc.)
-2. Convert it into professional clinical understanding
-3. Generate a SAFE and PRACTICAL prescription
+Understand ANY language input (Hindi, Hinglish, English etc)
+Return PROFESSIONAL ENGLISH medical output.
 
-IMPORTANT RULES:
-- Output STRICT JSON ONLY (no text outside JSON)
-- Always respond in ENGLISH (professional medical format)
-- Do NOT leave fields empty
-- Keep medicines realistic and safe
-- Diet and exercise MUST be condition-specific
-- Avoid dangerous or restricted drugs
+STRICT RULES:
+- JSON ONLY
+- No empty fields
+- Safe medicines only
 
-INPUT (patient complaint in any language):
-"${text}"
+INPUT:
+${text}
 
-OUTPUT FORMAT:
+OUTPUT:
 {
   "language_detected": "",
   "symptoms": [],
@@ -70,7 +61,7 @@ OUTPUT FORMAT:
   "medicines": [
     {
       "name": "",
-      "type": "allopathy/homeopathy/ayurveda/electrohomeopathy",
+      "type": "",
       "dosage": "",
       "duration": ""
     }
@@ -84,23 +75,18 @@ OUTPUT FORMAT:
           ],
         },
       ],
-      generationConfig: {
-        temperature: 0.3,
-      },
+      generationConfig: { temperature: 0.3 },
     }),
   });
 
   const data = await res.json();
 
-  let txt =
-    data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
+  let txt = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
   txt = txt.replace(/```json|```/g, "").trim();
 
   try {
     return JSON.parse(txt);
-  } catch (err) {
-    console.log("❌ JSON Parse Error:", txt);
+  } catch {
     return {};
   }
 }
@@ -130,24 +116,38 @@ async function learnEverything(
   symptoms,
   medicines,
   aiData,
-  finalData
+  finalData,
+  source
 ) {
   const now = new Date();
+
+  // 🧠 confidence logic
+  const confidence = source === "database" ? 0.9 : 0.7;
 
   // 1. prescriptions
   await db.collection("prescriptions").add({
     doctor_id,
     symptoms,
     medicines,
+    ai_used: source === "ai",
+    confidence_score: confidence,
     created_at: now,
   });
 
-  // 2. medicine_master
+  // 2. medicine_master (no duplicate basic check)
   for (const med of medicines) {
-    await db.collection("medicine_master").add({
-      name: normalize(med),
-      created_at: now,
-    });
+    const existing = await db
+      .collection("medicine_master")
+      .where("name", "==", normalize(med))
+      .limit(1)
+      .get();
+
+    if (existing.empty) {
+      await db.collection("medicine_master").add({
+        name: normalize(med),
+        created_at: now,
+      });
+    }
   }
 
   // 3. symptoms_keywords
@@ -173,44 +173,63 @@ async function learnEverything(
     }
   }
 
-  // 5. ai_learning
-  if (JSON.stringify(aiData) !== JSON.stringify(finalData)) {
+  // 5. ai_learning (only if AI used)
+  if (source === "ai") {
     await db.collection("ai_learning").add({
       aiData,
-      correctedData: finalData,
+      finalData,
       created_at: now,
     });
   }
 }
 
-/* 🚀 ANALYZE API */
+/* 🚀 FINAL ANALYZE (AUTO EVERYTHING) */
 app.post("/analyze", async (req, res) => {
   try {
-    const { text } = req.body;
+    const { text, doctor_id = "auto_doc" } = req.body;
 
     if (!text) {
       return res.status(400).json({ error: "Text required" });
     }
 
-    // 1. AI se symptoms
+    // 1. AI call
     const aiData = await callGemini(text);
     const symptoms = aiData.symptoms || [];
 
-    // 2. DB check
+    // 2. DB search
     const dbMeds = await searchFromDB(symptoms);
 
+    let finalData = {};
+    let source = "ai";
+
     if (dbMeds.length > 0) {
-      return res.json({
-        source: "database",
+      source = "database";
+
+      finalData = {
         symptoms,
         medicines: dbMeds,
-      });
+      };
+    } else {
+      finalData = aiData;
     }
 
-    // 3. AI fallback
-    return res.json({
-      source: "ai",
-      ...aiData,
+    // 🔥 AUTO LEARNING
+    await learnEverything(
+      doctor_id,
+      finalData.symptoms || [],
+      (finalData.medicines || []).map((m) =>
+        typeof m === "string" ? m : m.name
+      ),
+      aiData,
+      finalData,
+      source
+    );
+
+    // ✅ FINAL RESPONSE
+    res.json({
+      source,
+      confidence_score: source === "database" ? 0.9 : 0.7,
+      ...finalData,
     });
 
   } catch (e) {
@@ -218,42 +237,12 @@ app.post("/analyze", async (req, res) => {
   }
 });
 
-/* 💾 SAVE API */
-app.post("/save", async (req, res) => {
-  try {
-    const {
-      doctor_id = "default_doc",
-      symptoms,
-      medicines,
-      aiData = {},
-      finalData = {},
-    } = req.body;
-
-    if (!symptoms || !medicines) {
-      return res.status(400).json({ error: "Missing data" });
-    }
-
-    await learnEverything(
-      doctor_id,
-      symptoms,
-      medicines,
-      aiData,
-      finalData
-    );
-
-    res.json({ success: true });
-
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-/* 🧪 TEST ROUTE */
+/* 🧪 TEST */
 app.get("/", (req, res) => {
-  res.send("🔥 AI Doctor Backend Running");
+  res.send("🔥 AI Doctor Backend Running FINAL");
 });
 
 /* 🚀 START */
 app.listen(process.env.PORT || 3000, () => {
-  console.log("🔥 Server running");
+  console.log("🔥 FINAL SERVER RUNNING");
 });
