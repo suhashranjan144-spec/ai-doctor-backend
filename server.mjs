@@ -22,10 +22,9 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = "gemini-2.5-flash"; 
+const MODEL = "gemini-2.5-flash"; // Wahi version jo aap use kar rahe the
 
 const normalize = (t) => t?.toLowerCase().trim();
-const localCache = new Map();
 
 /* 🔥 REFINED JSON PARSER */
 function safeJSON(txt) {
@@ -49,30 +48,13 @@ function safeJSON(txt) {
   }
 }
 
-/* 🔥 POWERFUL MEDICAL PROMPT (No more childish behavior) */
-const MASTER_PROMPT = `
-You are a Senior Consultant Medical Doctor.
-TASKS:
-1. Translate patient complaints from any local language (Hindi/Marathi/Hinglish/Bengali) to Clinical English.
-2. Provide a specific Clinical Diagnosis.
-3. PRESCRIBE MEDICINES:
-   - If pathy is "electrohomeopathy", use EH remedies (S1, F1, A2, C5, L1, BE, WE, RE, etc.).
-   - If pathy is "allopathy", use standard clinical drugs.
-4. If the input is vague, use clinical judgment to provide the most likely prescription.
-
-STRICT OUTPUT FORMAT (JSON ONLY):
-{
-  "symptoms": ["Clinical term 1", "Clinical term 2"],
-  "diagnosis": "Specific Condition Name",
-  "medicines": [{"name": "Exact Name", "type": "primary", "pathy": "Pathy Name", "dosage": "Exact Dose", "duration": "Days"}],
-  "diet": ["Clinical diet advice"],
-  "exercise": ["Physical recovery advice"],
-  "precautions": ["Medical safety tips"]
-}`;
+const MASTER_PROMPT = `You are a Senior Consultant Medical Doctor.
+TASKS: Translate complaints to Clinical English, Provide Diagnosis, and Prescribe Medicines.
+PATHY: If 'electrohomeopathy', use EH remedies. If 'allopathy', use standard drugs.
+FORMAT: JSON ONLY.`;
 
 /* 🔥 GEMINI CALLER */
 async function callGemini(text, pathy) {
-  // Pathy name cleaning
   const cleanPathy = pathy.toLowerCase().includes("electro") ? "electrohomeopathy" : pathy;
   const prompt = `Requested Pathy: ${cleanPathy}\nPatient Data: ${text}\n\n${MASTER_PROMPT}`;
   
@@ -93,18 +75,15 @@ async function callGemini(text, pathy) {
     const data = await res.json();
     const txt = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
     return safeJSON(txt);
-  } catch (e) { 
-    return safeJSON(""); 
-  }
+  } catch (e) { return safeJSON(""); }
 }
 
-/* 🔥 ANALYZE ENDPOINT (With Local Logic Maintenance) */
+/* 🔥 ANALYZE ENDPOINT */
 app.post("/analyze", async (req, res) => {
   try {
     const { text, doctor_pathy = "allopathy" } = req.body;
     if (!text) return res.status(400).json({ error: "Input text is required" });
 
-    // Step 1: Check Symptoms Keywords in DB
     let symptomsList = [];
     const snap = await db.collection("symptoms_keywords").get();
     snap.forEach(doc => {
@@ -114,7 +93,6 @@ app.post("/analyze", async (req, res) => {
       });
     });
 
-    // Step 2: Check Medicine Master
     let dbMeds = [];
     if (symptomsList.length > 0) {
       for (const sym of [...new Set(symptomsList)]) {
@@ -128,51 +106,60 @@ app.post("/analyze", async (req, res) => {
 
     let finalData;
     if (dbMeds.length >= 3) {
-      finalData = {
-        symptoms: [...new Set(symptomsList)],
-        diagnosis: "Verified from clinic database",
-        medicines: dbMeds,
-        diet: ["Follow standard diet"], exercise: ["Rest"], precautions: ["Standard care"],
-        source: "local_db"
-      };
+      finalData = { symptoms: [...new Set(symptomsList)], diagnosis: "Verified from clinic database", medicines: dbMeds, source: "local_db" };
     } else {
       const ai = await callGemini(text, doctor_pathy);
       finalData = { ...ai, source: "gemini" };
     }
-
     finalData.prescription_id = db.collection("prescriptions").doc().id;
     res.json(finalData);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* 🔥 SAVE PRESCRIPTION (No change, keeping your solid logic) */
+/* 🔥 SMART SAVE ENDPOINT */
 app.post("/save-prescription", async (req, res) => {
   try {
     const { prescription_id, doctor_id, patient_id, doctor_pathy, medicines, symptoms, source } = req.body;
-    await db.collection("prescriptions").doc(prescription_id).set({
-      doctor_id, patient_id, doctor_pathy, medicines, symptoms, source, created_at: new Date()
-    });
     const batch = db.batch();
+    const ts = new Date();
+
+    // 1. Prescription Save
+    batch.set(db.collection("prescriptions").doc(prescription_id), {
+      doctor_id, patient_id, doctor_pathy, medicines, symptoms, source, created_at: ts
+    });
+
     (medicines || []).forEach(m => {
-      const name = normalize(m.name);
-      batch.set(db.collection("doctor_uses").doc(), { doctor_id, medicine_name: name, symptoms, doctor_pathy, type: source, created_at: new Date() });
-      if (source === "direct" || source === "edited") {
-        batch.set(db.collection("medicine_master").doc(name), {
-          name, pathy: doctor_pathy, symptoms, usage_count: admin.firestore.FieldValue.increment(5), verified: true, updated_at: new Date()
+      const medName = normalize(m.name);
+      
+      // 2. Doctor Uses Log
+      batch.set(db.collection("doctor_uses").doc(), { doctor_id, medicine_name: medName, symptoms, doctor_pathy, type: source, created_at: ts });
+
+      // 3. SMART SYNC (Learning + Medicine Master + Keywords)
+      if (source === "edited" || source === "direct") {
+        // AI Learning Log
+        batch.set(db.collection("ai_learning").doc(), { input_symptoms: symptoms, doctor_medicine: medName, pathy: doctor_pathy, timestamp: ts });
+
+        // Medicine Master Update
+        const masterRef = db.collection("medicine_master").doc(`${doctor_pathy}_${medName.replace(/\s+/g, '_')}`);
+        batch.set(masterRef, {
+          name: m.name, pathy: doctor_pathy, symptoms: admin.firestore.FieldValue.arrayUnion(...symptoms),
+          usage_count: admin.firestore.FieldValue.increment(1), verified: true, updated_at: ts
         }, { merge: true });
+
+        // Symptoms Keywords Update
+        symptoms.forEach(sym => {
+          const symKey = normalize(sym).replace(/\s+/g, '_');
+          batch.set(db.collection("symptoms_keywords").doc(symKey), {
+            symptom: sym, keywords_lowercase: admin.firestore.FieldValue.arrayUnion(normalize(sym))
+          }, { merge: true });
+        });
       }
     });
+
     await batch.commit();
-    res.json({ success: true, message: "Database Updated!" });
+    res.json({ success: true, message: "VyonaLife Synced Successfully!" });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* 🔐 OTHER ENDPOINTS */
-app.post("/request-access", async (req, res) => {
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  await db.collection("otp_sessions").add({ otp, patient_id: req.body.patient_id, doctor_id: req.body.doctor_id, used: false, created_at: Date.now() });
-  res.json({ success: true, otp }); 
-});
-
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 ZEQVEX v1.7.2 SECURE` ));
+app.listen(PORT, () => console.log(`🚀 BACKEND READY (Gemini 2.5 Flash)`));
