@@ -42,12 +42,11 @@ async function callGemini(text) {
               text: `
 You are a multi-pathy clinical assistant.
 
-Understand ANY language input (Hindi, Hinglish, English etc)
-Return PROFESSIONAL ENGLISH medical output.
+Understand ANY language input
+Return PROFESSIONAL ENGLISH JSON
 
-STRICT RULES:
+STRICT:
 - JSON ONLY
-- No empty fields
 - Safe medicines only
 
 INPUT:
@@ -80,7 +79,6 @@ OUTPUT:
   });
 
   const data = await res.json();
-
   let txt = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
   txt = txt.replace(/```json|```/g, "").trim();
 
@@ -91,26 +89,50 @@ OUTPUT:
   }
 }
 
-/* 🔍 DB SEARCH */
+/* 🔥 LEVEL 2: SMART DB SEARCH (RANKING) */
 async function searchFromDB(symptoms) {
-  let meds = [];
+  let medMap = {};
 
   for (const sym of symptoms) {
     const snap = await db
-      .collection("symptoms_keywords")
+      .collection("doctor_uses")
       .where("symptom", "==", normalize(sym))
-      .limit(3)
       .get();
 
     snap.forEach((doc) => {
-      meds.push(doc.data().medicine);
+      const data = doc.data();
+      const med = data.medicine;
+      const score = data.usage_count || 1;
+
+      if (!medMap[med]) medMap[med] = 0;
+      medMap[med] += score;
     });
   }
 
-  return [...new Set(meds)];
+  return Object.entries(medMap)
+    .sort((a, b) => b[1] - a[1])
+    .map((x) => x[0])
+    .slice(0, 5);
 }
 
-/* 💀 LEARNING ENGINE */
+/* 🔥 LEVEL 3: SMART FILTER */
+function removeDuplicates(medicines) {
+  const seen = new Set();
+  const result = [];
+
+  for (const m of medicines) {
+    const name = normalize(typeof m === "string" ? m : m.name);
+
+    if (!seen.has(name)) {
+      seen.add(name);
+      result.push(m);
+    }
+  }
+
+  return result;
+}
+
+/* 💀 LEARNING ENGINE (UPGRADED) */
 async function learnEverything(
   doctor_id,
   symptoms,
@@ -121,20 +143,21 @@ async function learnEverything(
 ) {
   const now = new Date();
 
-  // 🧠 confidence logic
-  const confidence = source === "database" ? 0.9 : 0.7;
+  const confidence =
+    source === "database" ? 0.95 :
+    source === "hybrid" ? 0.85 : 0.7;
 
-  // 1. prescriptions
+  // prescriptions
   await db.collection("prescriptions").add({
     doctor_id,
     symptoms,
     medicines,
-    ai_used: source === "ai",
+    ai_used: source !== "database",
     confidence_score: confidence,
     created_at: now,
   });
 
-  // 2. medicine_master (no duplicate basic check)
+  // medicine_master
   for (const med of medicines) {
     const existing = await db
       .collection("medicine_master")
@@ -150,17 +173,26 @@ async function learnEverything(
     }
   }
 
-  // 3. symptoms_keywords
+  // 🔥 NO DUPLICATE symptoms_keywords
   for (const sym of symptoms) {
     for (const med of medicines) {
-      await db.collection("symptoms_keywords").add({
-        symptom: normalize(sym),
-        medicine: normalize(med),
-      });
+      const existing = await db
+        .collection("symptoms_keywords")
+        .where("symptom", "==", normalize(sym))
+        .where("medicine", "==", normalize(med))
+        .limit(1)
+        .get();
+
+      if (existing.empty) {
+        await db.collection("symptoms_keywords").add({
+          symptom: normalize(sym),
+          medicine: normalize(med),
+        });
+      }
     }
   }
 
-  // 4. doctor_uses
+  // doctor_uses (learning)
   for (const sym of symptoms) {
     for (const med of medicines) {
       await db.collection("doctor_uses").add({
@@ -173,8 +205,8 @@ async function learnEverything(
     }
   }
 
-  // 5. ai_learning (only if AI used)
-  if (source === "ai") {
+  // AI learning
+  if (source !== "database") {
     await db.collection("ai_learning").add({
       aiData,
       finalData,
@@ -183,7 +215,7 @@ async function learnEverything(
   }
 }
 
-/* 🚀 FINAL ANALYZE (AUTO EVERYTHING) */
+/* 🚀 FINAL ANALYZE */
 app.post("/analyze", async (req, res) => {
   try {
     const { text, doctor_id = "auto_doc" } = req.body;
@@ -192,32 +224,42 @@ app.post("/analyze", async (req, res) => {
       return res.status(400).json({ error: "Text required" });
     }
 
-    // 1. AI call
+    // AI
     const aiData = await callGemini(text);
     const symptoms = aiData.symptoms || [];
 
-    // 2. DB search
+    // DB
     const dbMeds = await searchFromDB(symptoms);
 
     let finalData = {};
     let source = "ai";
 
+    // 🔥 HYBRID ENGINE
     if (dbMeds.length > 0) {
-      source = "database";
+      source = "hybrid";
 
       finalData = {
-        symptoms,
-        medicines: dbMeds,
+        ...aiData,
+        medicines: [
+          ...dbMeds.map((m) => ({ name: m, source: "database" })),
+          ...(aiData.medicines || []).map((m) => ({
+            ...m,
+            source: "ai",
+          })),
+        ],
       };
     } else {
       finalData = aiData;
     }
 
-    // 🔥 AUTO LEARNING
+    // 🔥 REMOVE DUPLICATES
+    finalData.medicines = removeDuplicates(finalData.medicines || []);
+
+    // LEARN
     await learnEverything(
       doctor_id,
       finalData.symptoms || [],
-      (finalData.medicines || []).map((m) =>
+      finalData.medicines.map((m) =>
         typeof m === "string" ? m : m.name
       ),
       aiData,
@@ -225,10 +267,12 @@ app.post("/analyze", async (req, res) => {
       source
     );
 
-    // ✅ FINAL RESPONSE
+    // RESPONSE
     res.json({
       source,
-      confidence_score: source === "database" ? 0.9 : 0.7,
+      confidence_score:
+        source === "database" ? 0.95 :
+        source === "hybrid" ? 0.85 : 0.7,
       ...finalData,
     });
 
@@ -237,12 +281,12 @@ app.post("/analyze", async (req, res) => {
   }
 });
 
-/* 🧪 TEST */
+/* TEST */
 app.get("/", (req, res) => {
-  res.send("🔥 AI Doctor Backend Running FINAL");
+  res.send("🔥 AI DOCTOR GOD MODE RUNNING");
 });
 
-/* 🚀 START */
+/* START */
 app.listen(process.env.PORT || 3000, () => {
-  console.log("🔥 FINAL SERVER RUNNING");
+  console.log("🔥 SERVER STARTED");
 });
