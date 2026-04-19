@@ -22,8 +22,49 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
 
+
+// 🔥 MASTER MEDICINE TEMPLATE (👉 YAHI DALNA HAI)
+function createMedicineDoc(name, pathy) {
+  const norm = name.toLowerCase();
+
+  return {
+    name: name,
+    name_lowercase: norm,
+
+    pathy: pathy || "unknown",
+
+    category: "general",
+
+    treats: [],
+    search_keywords: [norm],
+
+    organ: [],
+
+    combination_with: [],
+
+    common_dose: "",
+    default_times: [],
+    duration_days: 0,
+    frequency: 0,
+
+    severity_support: ["low", "medium"],
+
+    contraindications: [],
+
+    side_effects: [],
+
+    priority_score: 1,
+
+    verified: false,
+
+    created_at: new Date(),
+  };
+}
+
 /* 🧠 UTILS */
 const normalize = (t) => t?.toLowerCase().trim();
+
+
 const generateOTP = () =>
   Math.floor(100000 + Math.random() * 900000).toString();
 
@@ -49,83 +90,100 @@ function detectType(med) {
 /* 🤖 GEMINI CALLER */
 async function callGemini(text, doctor_type, mode = "clinical") {
   try {
-    // ✅ PROMPT (ONLY ONE)
- const clinicalPrompt = `
-You are a SUPER-INTELLIGENT MULTI-PATHY CLINICAL AI.
 
-DOCTOR TYPE RULES:
+const clinicalPrompt = `
 
-1. If doctor_type = "allopathy":
-- ONLY return allopathy medicines
+You are a highly advanced clinical AI assistant.
 
-2. If doctor_type = "homeopathy":
-- PRIMARY = homeopathy
-- SUGGESTION = allopathy
+Understand patient input in ANY language (Hindi, Gujarati, Marathi, Hinglish, etc.) but respond in PROFESSIONAL MEDICAL ENGLISH.
 
-3. If doctor_type = "ayurveda":
-- PRIMARY = ayurveda
-- SUGGESTION = allopathy
+-------------------------------
+⚠️ STRICT SYSTEM RULES
+-------------------------------
+- Output ONLY VALID JSON
+- No explanation, no extra text
+- DO NOT change structure
+- DO NOT skip fields
+- DO NOT return null values
+- Always fill arrays (even if empty [])
 
-4. If doctor_type = "electrohomeopathy":
-- PRIMARY = electrohomeopathy
-- SUGGESTION = allopathy
+-------------------------------
+🧠 CLINICAL BEHAVIOR RULES
+-------------------------------
+- Extract clear, short symptoms (1–2 words)
+- Provide realistic diagnosis (not random)
+- Prefer clinically safe suggestions
+- Avoid unnecessary medicines
+- Add precautions if risk present
 
-5. If doctor_type = "unani":
-- PRIMARY = unani
-- SUGGESTION = allopathy
+-------------------------------
+💊 DOCTOR TYPE RULES
+-------------------------------
+1. allopathy:
+   - Only allopathy medicines
 
-STRICT:
-- Output ONLY valid JSON
-- No explanation
+2. homeopathy:
+   - Prefer homeopathy
+   - Allopathy allowed as secondary
 
-FORMAT:
+3. ayurveda:
+   - Prefer ayurveda
+   - Allopathy allowed as secondary
+
+4. electrohomeopathy:
+   - STRICT electrohomeopathy medicines (S, WE, C, etc.)
+   - Allopathy allowed as secondary
+
+5. unani:
+   - Prefer unani
+   - Allopathy allowed as secondary
+
+-------------------------------
+📦 OUTPUT FORMAT (STRICT JSON)
+-------------------------------
 {
+  "language_detected": "",
   "symptoms": [],
   "diagnosis": "",
-  "primary_medicines": [],
-  "suggested_medicines": []
+  "possible_conditions": [],
+
+  "primary_medicines": [
+    {
+      "name": "",
+      "type": "",
+      "dosage": "",
+      "duration": "",
+      "instructions": ""
+    }
+  ],
+
+  "suggested_medicines": [
+    {
+      "name": "",
+      "type": "",
+      "dosage": "",
+      "duration": "",
+      "instructions": ""
+    }
+  ],
+
+  "diet": [],
+  "exercise": [],
+  "precautions": [],
+  "severity": "mild/moderate/critical",
+  "risks": [],
+  "red_flags": []
 }
 
+-------------------------------
+📥 INPUT
+-------------------------------
 INPUT: ${text}
 DOCTOR TYPE: ${doctor_type}
+
 `;
 
-const patientPrompt = `
-You are a PATIENT-FRIENDLY CLINICAL AI.
-
-Use simple Hinglish. Explain like a normal human.
-
-DOCTOR TYPE RULES:
-
-1. If doctor_type = "allopathy":
-- Only allopathy medicines
-
-2. Other pathy:
-- First same pathy medicines
-- Then allopathy as optional
-
-STRICT:
-- Output ONLY JSON
-
-FORMAT:
-{
-  "problem_explained": "",
-  "what_happening_in_body": "",
-  "main_medicines": [],
-  "optional_medicines": [],
-  "home_care": [],
-  "what_to_avoid": [],
-  "when_to_worry": [],
-  "severity": ""
-}
-
-INPUT: ${text}
-DOCTOR TYPE: ${doctor_type}
-`;
-
-// 🔥 FINAL LINE (VERY IMPORTANT)
-const prompt = mode === "patient" ? patientPrompt : clinicalPrompt; 
-
+const prompt = mode === "patient" ? patientPrompt : clinicalPrompt;
 
     // ✅ ONLY ONE FETCH
     const response = await fetch(
@@ -192,6 +250,7 @@ if (doctor_type === "allopathy") {
 /* 🔥 DB BRAIN */
 async function dbBrain(symptoms) {
   let medMap = {};
+const symptomCount = symptoms.length;
 
   for (const sym of symptoms) {
     const normSym = normalize(sym);
@@ -202,12 +261,19 @@ async function dbBrain(symptoms) {
       .where("symptom", "==", normSym)
       .get();
 
-    snap1.forEach((d) => {
-      const data = d.data();
-      medMap[data.medicine] =
-        (medMap[data.medicine] || 0) + (data.usage_count || 1);
-    });
+   snap1.forEach((d) => {
+  const data = d.data();
 
+  const now = Date.now();
+  const lastUsed = data.last_used?.toDate()?.getTime() || 0;
+
+  const recencyBoost =
+    (now - lastUsed) < 3 * 24 * 60 * 60 * 1000 ? 2 : 1;
+
+  medMap[data.medicine] =
+    (medMap[data.medicine] || 0) +
+    (data.usage_count || 1) * 3 * recencyBoost * symptomCount;
+});
     const snap2 = await db
       .collection("symptoms_keywords")
       .where("symptom", "==", normSym)
@@ -224,22 +290,51 @@ async function dbBrain(symptoms) {
 
   for (let [med, score] of Object.entries(medMap)) {
     const snap = await db
-      .collection("medicine_master")
-      .where("name", "==", med)
-      .limit(1)
-      .get();
+      .collection("medicines_master")
+     .doc(med)
+     .get();
 
-    let type = snap.empty
-      ? detectType(med)
-      : snap.docs[0].data().type || detectType(med);
+   let type = snap.exists
+     ? snap.data().pathy || detectType(med)
+     : detectType(med);
 
-    result.push({ name: med, type, score });
+    result.push({
+  name: med,
+  type,
+  score,
+  pathy: type,
+confidence: Math.min(1, score / 10)
+});
   }
 
   return result.sort((a, b) => b.score - a.score).slice(0, 5);
 }
 
 /* 🧬 CLINICAL ENGINE */
+function detectDisease(symptoms) {
+  const s = symptoms.join(" ");
+
+  if (s.includes("fever") && s.includes("cough"))
+    return "viral infection";
+
+  if (s.includes("loose motion") || s.includes("diarrhea"))
+    return "gastroenteritis";
+
+  if (s.includes("worms") || s.includes("itching anus"))
+    return "worm infestation";
+
+  return "unknown";
+}
+function getComboMedicines(disease) {
+  const map = {
+    "viral infection": ["paracetamol", "ors"],
+    "gastroenteritis": ["ors", "metronidazole"],
+    "worm infestation": ["vermifugo-1", "we"],
+  };
+
+  return map[disease] || [];
+}
+
 function clinicalEngine(data) {
   const redFlags = [];
   const text = JSON.stringify(data).toLowerCase();
@@ -294,6 +389,7 @@ async function learningEngine(symptoms, medicines) {
             symptom: normSym,
             medicine: normMed,
             usage_count: FieldValue.increment(1),
+            last_used: new Date(),
           },
           { merge: true }
         );
@@ -310,19 +406,30 @@ async function learningEngine(symptoms, medicines) {
           { merge: true }
         );
 
+        await db
+  .collection("medicines_master")
+  .doc(normMed)
+  .set({
+    search_keywords: FieldValue.arrayUnion(normSym, normMed)
+  }, { merge: true });
+
+
       const snap = await db
-        .collection("medicine_master")
-        .where("name", "==", normMed)
-        .limit(1)
+        .collection("medicines_master")
+        .doc(normMed)
         .get();
 
-      if (snap.empty) {
-        await db.collection("medicine_master").add({
-          name: normMed,
-          type: detectType(normMed),
-          created_at: new Date(),
-        });
-      }
+       const isTrustedSource = true;
+       if (!snap.exists && isTrustedSource) {
+  const pathy = detectType(normMed);
+
+  const newMed = createMedicineDoc(normMed, pathy);
+
+  await db
+    .collection("medicines_master")
+    .doc(normMed)
+    .set(newMed, { merge: true });
+}
     }
   }
 }
@@ -338,6 +445,8 @@ app.post("/analyze", async (req, res) => {
       .filter((s) => s.length > 3);
 
     const dbMeds = await dbBrain(symptoms);
+    const disease = detectDisease(symptoms);
+    const comboMeds = getComboMedicines(disease);
 
     let final;
     let source;
@@ -350,34 +459,48 @@ app.post("/analyze", async (req, res) => {
       );
     }
 
+    // 🔥 AI ONLY CASE
     if (filteredMeds.length === 0) {
       const aiData = await callGemini(text, doctor_type);
 
+      const dbNames = new Set(
+  filteredMeds.map(m => normalize(m.name))
+);// ⚠️ FIXED
+
       final = {
-        ...aiData,
-        medicines: [
-          ...(aiData.primary_medicines || []),
-          ...(aiData.suggested_medicines || [])
-        ]
-      };
-
-      source = "ai";
-    } else {
-      const aiData = await callGemini(text, doctor_type);
-
-     final = {
-  symptoms,
-  diagnosis: "Hybrid result",
+  symptoms: aiData.symptoms || symptoms,
+  diagnosis: aiData.diagnosis || "AI result",
+  disease,
+  combo_medicines: comboMeds,
+  ...aiData,
   medicines: [
-    ...(aiData.primary_medicines || []),   // 👈 MOST IMPORTANT
-    ...filteredMeds.map(m => ({
-      name: m.name,
-      type: m.type,
-      source: "db"
-    })),
+    ...(aiData.primary_medicines || []),
     ...(aiData.suggested_medicines || [])
   ]
 };
+      source = "ai";
+    }
+
+    // 🔥 HYBRID CASE
+    else {
+      const aiData = await callGemini(text, doctor_type);
+
+      final = {
+        symptoms,
+        diagnosis: aiData.diagnosis || "Hybrid result",
+        disease,
+        combo_medicines: comboMeds,
+        medicines: [
+          ...(aiData.primary_medicines || []),
+          ...filteredMeds.map((m) => ({
+            name: m.name,
+            type: m.type,
+            source: "db",
+          })),
+          ...(aiData.suggested_medicines || []),
+        ],
+      };
+
       source = "hybrid";
     }
 
@@ -417,7 +540,6 @@ app.post("/analyze", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
 /* 🔐 VERIFY */
 app.post("/verify", async (req, res) => {
   const { prescription_id, otp } = req.body;
