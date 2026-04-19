@@ -1,21 +1,36 @@
 {
-  "name": "ai-doctor-backend",
+  "name": "zeqvex-clinical-engine",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Zeqvex AI Clinical Intelligence Backend (DB-first + AI fallback)",
+  "main": "server.mjs",
+  "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "nodemon server.mjs"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "ai",
+    "healthcare",
+    "clinical-engine",
+    "gemini",
+    "firebase",
+    "qr"
+  ],
+  "author": "Zeqvex",
   "license": "ISC",
-  "type": "module",
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^17.4.1",
     "express": "^5.2.1",
     "firebase-admin": "^13.8.0",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "qrcode": "^1.5.4",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
