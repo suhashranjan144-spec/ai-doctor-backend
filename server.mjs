@@ -47,10 +47,10 @@ function detectType(med) {
 }
 
 /* 🤖 GEMINI CALLER */
-async function callGemini(text, doctor_type) {
+async function callGemini(text, doctor_type, mode = "clinical") {
   try {
     // ✅ PROMPT (ONLY ONE)
-    const prompt = `
+ const clinicalPrompt = `
 You are a SUPER-INTELLIGENT MULTI-PATHY CLINICAL AI.
 
 DOCTOR TYPE RULES:
@@ -89,6 +89,43 @@ FORMAT:
 INPUT: ${text}
 DOCTOR TYPE: ${doctor_type}
 `;
+
+const patientPrompt = `
+You are a PATIENT-FRIENDLY CLINICAL AI.
+
+Use simple Hinglish. Explain like a normal human.
+
+DOCTOR TYPE RULES:
+
+1. If doctor_type = "allopathy":
+- Only allopathy medicines
+
+2. Other pathy:
+- First same pathy medicines
+- Then allopathy as optional
+
+STRICT:
+- Output ONLY JSON
+
+FORMAT:
+{
+  "problem_explained": "",
+  "what_happening_in_body": "",
+  "main_medicines": [],
+  "optional_medicines": [],
+  "home_care": [],
+  "what_to_avoid": [],
+  "when_to_worry": [],
+  "severity": ""
+}
+
+INPUT: ${text}
+DOCTOR TYPE: ${doctor_type}
+`;
+
+// 🔥 FINAL LINE (VERY IMPORTANT)
+const prompt = mode === "patient" ? patientPrompt : clinicalPrompt; 
+
 
     // ✅ ONLY ONE FETCH
     const response = await fetch(
