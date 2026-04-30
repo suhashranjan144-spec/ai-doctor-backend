@@ -22,6 +22,14 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
 
+const COLLECTIONS = {
+  prescriptions: "prescriptions",
+  medicinesMaster: "medicines_master",
+  symptomsKeywords: "symptoms_keywords",
+  doctorUses: "doctor_uses",
+  aiLearningQueue: "ai_learning_queue",
+};
+
 
 // 🔥 MASTER MEDICINE TEMPLATE (👉 YAHI DALNA HAI)
 function createMedicineDoc(name, pathy) {
@@ -85,6 +93,60 @@ function detectType(med) {
     return "homeopathy";
 
   return "unknown";
+}
+
+function toInt(value) {
+  if (typeof value === "number") return Math.trunc(value);
+  return Number.parseInt(String(value || "").trim(), 10);
+}
+
+function toStringList(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => normalize(item))
+    .filter((item) => !!item);
+}
+
+function requiredMissingFields(candidate = {}) {
+  const missing = [];
+  if (!normalize(candidate.dose)) missing.push("dose");
+  if (!normalize(candidate.frequency_unit)) missing.push("frequency_unit");
+  if (toStringList(candidate.intake_times).length === 0) {
+    missing.push("intake_times");
+  }
+
+  const durationDays = toInt(candidate.duration_days);
+  if (!Number.isInteger(durationDays) || durationDays <= 0) {
+    missing.push("duration_days");
+  }
+
+  if (!normalize(candidate.route)) missing.push("route");
+  if (!normalize(candidate.food_instruction)) missing.push("food_instruction");
+
+  return missing;
+}
+
+function toQueueCandidate(medicine = {}) {
+  const medicineName = normalize(medicine.name || medicine.medicine_name || "");
+  const candidate = {
+    medicine_name: medicineName,
+    generic_name: normalize(medicine.generic_name || ""),
+    dose: normalize(medicine.dose || medicine.dosage || ""),
+    frequency_unit: normalize(medicine.frequency_unit || ""),
+    intake_times: toStringList(medicine.intake_times),
+    duration_days: toInt(medicine.duration_days || medicine.duration || 0) || 0,
+    route: normalize(medicine.route || ""),
+    food_instruction: normalize(medicine.food_instruction || ""),
+    type: normalize(medicine.type || detectType(medicineName)),
+  };
+
+  const missing_required_fields = requiredMissingFields(candidate);
+  return {
+    ...candidate,
+    is_valid: missing_required_fields.length === 0,
+    is_incomplete: missing_required_fields.length > 0,
+    missing_required_fields,
+  };
 }
 
 /* 🤖 GEMINI CALLER */
@@ -257,7 +319,7 @@ const symptomCount = symptoms.length;
     if (!normSym) continue;
 
     const snap1 = await db
-      .collection("doctor_uses")
+      .collection(COLLECTIONS.doctorUses)
       .where("symptom", "==", normSym)
       .get();
 
@@ -275,7 +337,7 @@ const symptomCount = symptoms.length;
     (data.usage_count || 1) * 3 * recencyBoost * symptomCount;
 });
     const snap2 = await db
-      .collection("symptoms_keywords")
+      .collection(COLLECTIONS.symptomsKeywords)
       .where("symptom", "==", normSym)
       .get();
 
@@ -290,7 +352,7 @@ const symptomCount = symptoms.length;
 
   for (let [med, score] of Object.entries(medMap)) {
     const snap = await db
-      .collection("medicines_master")
+      .collection(COLLECTIONS.medicinesMaster)
      .doc(med)
      .get();
 
@@ -373,6 +435,9 @@ function removeDup(meds = []) {
 
 /* 🧠 LEARNING ENGINE */
 async function learningEngine(symptoms, medicines) {
+  // Legacy path disabled: direct master writes are blocked by policy.
+  throw new Error("Legacy learningEngine is disabled. Use learningQueueEngine.");
+
   for (const sym of symptoms) {
     const normSym = normalize(sym);
     if (!normSym) continue;
@@ -435,9 +500,69 @@ async function learningEngine(symptoms, medicines) {
 }
 
 /* 🚀 ANALYZE */
+async function learningQueueEngine({
+  symptoms = [],
+  medicines = [],
+  doctorId = "unknown_doctor",
+  doctorType = "allopathy",
+  rawText = "",
+  prescriptionId = "",
+}) {
+  const batch = db.batch();
+
+  for (const sym of symptoms) {
+    const normSym = normalize(sym);
+    if (!normSym) continue;
+
+    for (const med of medicines) {
+      const medicineObject =
+        typeof med === "string" ? { name: med } : med || {};
+      const queueCandidate = toQueueCandidate(medicineObject);
+      const normMed = normalize(queueCandidate.medicine_name);
+      if (!normMed) continue;
+
+      const queueDocId = `${normalize(doctorId) || "unknown"}_${normSym}_${normMed}`;
+      const queueRef = db.collection(COLLECTIONS.aiLearningQueue).doc(queueDocId);
+
+      batch.set(
+        queueRef,
+        {
+          doctor_id: doctorId || "unknown_doctor",
+          doctor_pathy: doctorType,
+          symptom: normSym,
+          medicine: normMed,
+          symptoms: [normSym],
+          raw_text: rawText || "",
+          prescription_id: prescriptionId || "",
+          candidate_payload: queueCandidate,
+          missing_required_fields: queueCandidate.missing_required_fields,
+          is_valid: false,
+          is_incomplete: true,
+          review_required: true,
+          schema_version: 1,
+          status: "pending_review",
+          source: "backend_fallback_guard",
+          queue_hits: FieldValue.increment(1),
+          last_seen_at: FieldValue.serverTimestamp(),
+          updated_at: FieldValue.serverTimestamp(),
+          created_at: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+  }
+
+  await batch.commit();
+}
+
 app.post("/analyze", async (req, res) => {
   try {
-    const { text, doctor_type = "allopathy" } = req.body;
+    const {
+      text,
+      doctor_type = "allopathy",
+      doctor_id = "unknown_doctor",
+      patient_id: requestedPatientId = "",
+    } = req.body;
 
     const symptoms = text
       .toLowerCase()
@@ -507,20 +632,25 @@ app.post("/analyze", async (req, res) => {
     final.medicines = removeDup(final.medicines);
     final = clinicalEngine(final);
 
-    await learningEngine(
-      symptoms,
-      final.medicines.map((m) => m.name)
-    );
-
     const prescription_id = uuidv4();
-    const patient_id = uuidv4();
+    const patient_id = requestedPatientId || uuidv4();
     const otp = generateOTP();
 
-    await db.collection("prescriptions").doc(prescription_id).set({
+    await db.collection(COLLECTIONS.prescriptions).doc(prescription_id).set({
       patient_id,
+      doctor_id,
       otp,
       data: final,
       created_at: new Date(),
+    });
+
+    await learningQueueEngine({
+      symptoms,
+      medicines: final.medicines,
+      doctorId: doctor_id,
+      doctorType: doctor_type,
+      rawText: text,
+      prescriptionId: prescription_id,
     });
 
     const qr = await QRCode.toDataURL(
@@ -541,11 +671,166 @@ app.post("/analyze", async (req, res) => {
   }
 });
 /* 🔐 VERIFY */
+app.post("/queue/review", async (req, res) => {
+  try {
+    const { queue_id, decision, reviewer_id = "unknown_reviewer" } = req.body;
+
+    if (!queue_id || !decision) {
+      return res.status(400).json({
+        success: false,
+        error: "queue_id and decision are required",
+      });
+    }
+
+    const queueRef = db.collection(COLLECTIONS.aiLearningQueue).doc(queue_id);
+    const queueDoc = await queueRef.get();
+
+    if (!queueDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "Queue item not found",
+      });
+    }
+
+    const queueData = queueDoc.data() || {};
+    if (queueData.status !== "pending_review") {
+      return res.status(400).json({
+        success: false,
+        error: "Queue item is not pending review",
+      });
+    }
+
+    if (decision === "reject") {
+      await queueRef.update({
+        status: "rejected",
+        reviewed_by: reviewer_id,
+        reviewed_at: FieldValue.serverTimestamp(),
+        updated_at: FieldValue.serverTimestamp(),
+      });
+
+      return res.json({ success: true, status: "rejected" });
+    }
+
+    if (decision !== "approve") {
+      return res.status(400).json({
+        success: false,
+        error: "decision must be approve or reject",
+      });
+    }
+
+    const candidate = queueData.candidate_payload || {};
+    const medicineName = normalize(candidate.medicine_name || queueData.medicine || "");
+    if (!medicineName) {
+      return res.status(400).json({
+        success: false,
+        error: "medicine_name missing in queue candidate",
+      });
+    }
+
+    const missing = requiredMissingFields(candidate);
+    if (missing.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Cannot approve incomplete candidate",
+        missing_required_fields: missing,
+      });
+    }
+
+    const symptomList = Array.isArray(queueData.symptoms)
+      ? queueData.symptoms.map((s) => normalize(s)).filter(Boolean)
+      : [normalize(queueData.symptom)].filter(Boolean);
+
+    const batch = db.batch();
+
+    const masterRef = db.collection(COLLECTIONS.medicinesMaster).doc(medicineName);
+    batch.set(
+      masterRef,
+      {
+        medicine_name: medicineName,
+        name: medicineName,
+        generic_name: normalize(candidate.generic_name || ""),
+        dose: normalize(candidate.dose || ""),
+        standard_dose: normalize(candidate.dose || ""),
+        frequency_unit: normalize(candidate.frequency_unit || ""),
+        intake_times: toStringList(candidate.intake_times),
+        duration_days: toInt(candidate.duration_days) || 0,
+        route: normalize(candidate.route || ""),
+        food_instruction: normalize(candidate.food_instruction || ""),
+        pathy: normalize(candidate.type || queueData.doctor_pathy || "unknown"),
+        verified: false,
+        source: "ai_learning_queue_approved",
+        updated_at: FieldValue.serverTimestamp(),
+        created_at: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    for (const symptom of symptomList) {
+      const keywordRef = db
+        .collection(COLLECTIONS.symptomsKeywords)
+        .doc(`${symptom}_${medicineName}`);
+      batch.set(
+        keywordRef,
+        {
+          symptom,
+          medicine: medicineName,
+          count: FieldValue.increment(1),
+          updated_at: FieldValue.serverTimestamp(),
+          created_at: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      const doctorId = normalize(queueData.doctor_id || "");
+      if (doctorId) {
+        const doctorUseRef = db
+          .collection(COLLECTIONS.doctorUses)
+          .doc(`${doctorId}_${symptom}_${medicineName}`);
+        batch.set(
+          doctorUseRef,
+          {
+            doctor_id: doctorId,
+            doctor_pathy: queueData.doctor_pathy || "unknown",
+            symptom,
+            medicine: medicineName,
+            usage_count: FieldValue.increment(1),
+            last_used: FieldValue.serverTimestamp(),
+            updated_at: FieldValue.serverTimestamp(),
+            created_at: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+    }
+
+    batch.update(queueRef, {
+      status: "approved",
+      reviewed_by: reviewer_id,
+      reviewed_at: FieldValue.serverTimestamp(),
+      promoted_to_master: true,
+      updated_at: FieldValue.serverTimestamp(),
+    });
+
+    await batch.commit();
+
+    return res.json({
+      success: true,
+      status: "approved",
+      medicine: medicineName,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
 app.post("/verify", async (req, res) => {
   const { prescription_id, otp } = req.body;
 
   const doc = await db
-    .collection("prescriptions")
+    .collection(COLLECTIONS.prescriptions)
     .doc(prescription_id)
     .get();
 
