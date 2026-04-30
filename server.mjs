@@ -21,8 +21,10 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
+const STRICT_AUTH = process.env.STRICT_AUTH !== "false";
 
 const COLLECTIONS = {
+  users: "users",
   prescriptions: "prescriptions",
   medicinesMaster: "medicines_master",
   symptomsKeywords: "symptoms_keywords",
@@ -147,6 +149,31 @@ function toQueueCandidate(medicine = {}) {
     is_incomplete: missing_required_fields.length > 0,
     missing_required_fields,
   };
+}
+
+async function resolveAuthUser(req) {
+  if (!STRICT_AUTH) {
+    return { uid: req.body?.reviewer_id || "dev_reviewer", role: "admin" };
+  }
+
+  const authHeader = req.headers.authorization || "";
+  if (!authHeader.startsWith("Bearer ")) {
+    return null;
+  }
+
+  const token = authHeader.replace("Bearer ", "").trim();
+  if (!token) {
+    return null;
+  }
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    const userDoc = await db.collection(COLLECTIONS.users).doc(decoded.uid).get();
+    const role = userDoc.exists ? (userDoc.data()?.role || "") : "";
+    return { uid: decoded.uid, role };
+  } catch (error) {
+    return null;
+  }
 }
 
 /* 🤖 GEMINI CALLER */
@@ -674,6 +701,21 @@ app.post("/analyze", async (req, res) => {
 app.post("/queue/review", async (req, res) => {
   try {
     const { queue_id, decision, reviewer_id = "unknown_reviewer" } = req.body;
+    const authUser = await resolveAuthUser(req);
+
+    if (!authUser) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized",
+      });
+    }
+
+    if (!["doctor", "admin"].includes(String(authUser.role))) {
+      return res.status(403).json({
+        success: false,
+        error: "Only doctor/admin can review queue",
+      });
+    }
 
     if (!queue_id || !decision) {
       return res.status(400).json({
@@ -703,7 +745,7 @@ app.post("/queue/review", async (req, res) => {
     if (decision === "reject") {
       await queueRef.update({
         status: "rejected",
-        reviewed_by: reviewer_id,
+        reviewed_by: authUser.uid || reviewer_id,
         reviewed_at: FieldValue.serverTimestamp(),
         updated_at: FieldValue.serverTimestamp(),
       });
@@ -805,7 +847,7 @@ app.post("/queue/review", async (req, res) => {
 
     batch.update(queueRef, {
       status: "approved",
-      reviewed_by: reviewer_id,
+      reviewed_by: authUser.uid || reviewer_id,
       reviewed_at: FieldValue.serverTimestamp(),
       promoted_to_master: true,
       updated_at: FieldValue.serverTimestamp(),
